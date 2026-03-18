@@ -1,1 +1,44 @@
+name: OANDA Gold CPR Bot
 
+on:
+  schedule:
+    # 9am–11pm SGT = 1am–3pm UTC  (SGT = UTC+8)
+    - cron: "*/10 1-14 * * 1-5"   # Mon–Fri 1am–2pm UTC (9am–10pm SGT)
+    - cron: "*/10 15 * * 1-5"     # Mon–Fri 3pm UTC (11pm SGT final window)
+
+  workflow_dispatch:               # Manual trigger anytime
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Setup Python
+        uses: actions/setup-python@v5.4.0
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Gold CPR Bot
+        env:
+          OANDA_API_KEY:    ${{ secrets.OANDA_API_KEY }}
+          OANDA_ACCOUNT_ID: ${{ secrets.OANDA_ACCOUNT_ID }}
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bot.py
+
+      - name: Save logs
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: gold-logs-${{ github.run_number }}
+          path: |
+            trades_*.json
+            performance_log.txt
+          retention-days: 30
