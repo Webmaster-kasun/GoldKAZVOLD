@@ -1,8 +1,8 @@
 """
-OANDA Trade Executor
-- Retry + backoff on rate limit (429)
-- 0.5s delay between all API calls to avoid rate limiting
-- Balance cached from login
+OANDA Trade Executor - Minimal API calls version
+- Single account fetch gives balance + positions + margin
+- 1 second delay between calls
+- Retry on 429
 """
 
 import os
@@ -12,81 +12,79 @@ import logging
 
 log = logging.getLogger(__name__)
 
-CALL_DELAY = 0.5  # seconds between API calls — prevents rate limiting
-
 
 class OandaTrader:
     def __init__(self, demo=True):
-        self.api_key     = os.environ.get("OANDA_API_KEY", "")
-        self.account_id  = os.environ.get("OANDA_ACCOUNT_ID", "")
-        self.demo        = demo
-        self.base_url    = "https://api-fxpractice.oanda.com" if demo else "https://api-trade.oanda.com"
-        self.headers     = {
+        self.api_key      = os.environ.get("OANDA_API_KEY", "")
+        self.account_id   = os.environ.get("OANDA_ACCOUNT_ID", "")
+        self.demo         = demo
+        self.base_url     = "https://api-fxpractice.oanda.com" if demo else "https://api-trade.oanda.com"
+        self.headers      = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type":  "application/json"
         }
-        self.last_balance = 0.0
+        self.last_balance          = 0.0
+        self.last_margin_available = 0.0
+        self._account_cache        = None   # full account snapshot — reused within same scan
         log.info(f"OANDA | Mode: {'DEMO/PRACTICE' if demo else 'LIVE'}")
         log.info(f"OANDA | URL:  {self.base_url}")
         log.info(f"Account: {self.account_id}")
         if self.api_key:
             log.info(f"API Key: {self.api_key[:8]}****")
         else:
-            log.error("API Key is EMPTY — check OANDA_API_KEY environment variable!")
+            log.error("API Key EMPTY — check OANDA_API_KEY")
 
     def _get(self, url, params=None, retries=3):
-        """GET with delay + retry on rate limit."""
-        time.sleep(CALL_DELAY)
+        time.sleep(1.0)   # 1 second between every call — conservative
         for attempt in range(retries):
             try:
-                r = requests.get(url, headers=self.headers, params=params, timeout=15)
+                r = requests.get(url, headers=self.headers, params=params, timeout=20)
                 if r.status_code == 429:
-                    wait = 15 * (attempt + 1)
-                    log.warning(f"Rate limited (429) — waiting {wait}s before retry {attempt+1}/{retries}")
+                    wait = 30 * (attempt + 1)
+                    log.warning(f"Rate limited — waiting {wait}s")
                     time.sleep(wait)
                     continue
                 return r
-            except requests.exceptions.Timeout:
-                log.warning(f"Timeout attempt {attempt+1}/{retries}")
-                time.sleep(5)
             except Exception as e:
                 log.warning(f"Request error attempt {attempt+1}: {e}")
-                time.sleep(3)
+                time.sleep(5)
         return None
 
     def login(self):
-        if not self.api_key:
-            log.error("Login failed: OANDA_API_KEY is empty")
-            return False
-        if not self.account_id:
-            log.error("Login failed: OANDA_ACCOUNT_ID is empty")
+        """
+        Single call — fetches account summary which gives us:
+        balance, margin, open trade count — cached for whole scan.
+        """
+        if not self.api_key or not self.account_id:
+            log.error("Login failed: missing API key or account ID")
             return False
         try:
-            url = f"{self.base_url}/v3/accounts/{self.account_id}"
+            url = f"{self.base_url}/v3/accounts/{self.account_id}/summary"
             r   = self._get(url)
             if r is None:
-                log.error("Login failed: no response after retries")
+                log.error("Login failed: no response")
                 return False
-            log.info(f"Login status: {r.status_code}")
-            log.info(f"Login response: {r.text[:200]}")
             if r.status_code == 200:
-                self.last_balance = float(r.json()["account"]["balance"])
-                log.info(f"Login success! Balance: ${self.last_balance:.2f}")
+                acct                       = r.json()["account"]
+                self.last_balance          = float(acct["balance"])
+                self.last_margin_available = float(acct.get("marginAvailable", self.last_balance))
+                self._account_cache        = acct
+                log.info(f"Login OK | Balance: ${self.last_balance:.2f} | Margin: ${self.last_margin_available:.2f}")
                 return True
-            elif r.status_code == 401:
-                log.error("401 Unauthorized — API key wrong or expired")
-            elif r.status_code == 403:
-                log.error("403 Forbidden — Account ID may be wrong")
-            else:
-                log.error(f"Login failed: {r.status_code} {r.text}")
+            log.error(f"Login failed: {r.status_code} {r.text[:200]}")
             return False
         except Exception as e:
             log.error(f"Login error: {e}")
             return False
 
     def get_balance(self):
-        """Returns cached balance — avoids extra API call."""
-        return self.last_balance
+        return self.last_balance   # cached — no API call
+
+    def get_open_trade_count(self):
+        """From cache — no API call."""
+        if self._account_cache:
+            return int(self._account_cache.get("openTradeCount", 0))
+        return 0
 
     def get_price(self, instrument):
         try:
@@ -95,15 +93,18 @@ class OandaTrader:
                 params={"instruments": instrument}
             )
             if r and r.status_code == 200:
-                price = r.json()["prices"][0]
-                bid   = float(price["bids"][0]["price"])
-                ask   = float(price["asks"][0]["price"])
+                p   = r.json()["prices"][0]
+                bid = float(p["bids"][0]["price"])
+                ask = float(p["asks"][0]["price"])
                 return (bid + ask) / 2, bid, ask
         except Exception as e:
             log.error(f"get_price error: {e}")
         return None, None, None
 
     def get_position(self, instrument):
+        """Uses open trade count from cache to skip API call if no trades open."""
+        if self.get_open_trade_count() == 0:
+            return None   # no open trades — skip API call entirely
         try:
             r = self._get(f"{self.base_url}/v3/accounts/{self.account_id}/positions/{instrument}")
             if r and r.status_code == 200:
@@ -119,11 +120,13 @@ class OandaTrader:
 
     def check_pnl(self, position):
         try:
-            long_pnl  = float(position["long"].get("unrealizedPL", 0))
-            short_pnl = float(position["short"].get("unrealizedPL", 0))
-            return long_pnl + short_pnl
+            return float(position["long"].get("unrealizedPL", 0)) + \
+                   float(position["short"].get("unrealizedPL", 0))
         except:
             return 0
+
+    def get_margin_available(self):
+        return self.last_margin_available  # cached — no API call
 
     def place_order(self, instrument, direction, size, stop_distance, limit_distance):
         try:
@@ -136,47 +139,41 @@ class OandaTrader:
             precision = 2    if instrument == "XAU_USD" else (3    if "JPY" in instrument else 5)
             entry     = ask if direction == "BUY" else bid
 
-            if direction == "BUY":
-                sl_price = round(entry - stop_distance  * pip, precision)
-                tp_price = round(entry + limit_distance * pip, precision)
-            else:
-                sl_price = round(entry + stop_distance  * pip, precision)
-                tp_price = round(entry - limit_distance * pip, precision)
+            sl_price = round(entry - stop_distance * pip, precision) if direction == "BUY" \
+                       else round(entry + stop_distance * pip, precision)
+            tp_price = round(entry + limit_distance * pip, precision) if direction == "BUY" \
+                       else round(entry - limit_distance * pip, precision)
 
-            log.info(f"Placing {direction} {instrument} | units={units} | entry={entry} | SL={sl_price} | TP={tp_price}")
+            log.info(f"Order: {direction} {instrument} x{units} | entry={entry} SL={sl_price} TP={tp_price}")
 
-            time.sleep(CALL_DELAY)
+            time.sleep(1.0)
             r = requests.post(
                 f"{self.base_url}/v3/accounts/{self.account_id}/orders",
                 headers=self.headers,
                 json={"order": {
-                    "type":        "MARKET",
-                    "instrument":  instrument,
-                    "units":       str(units),
-                    "timeInForce": "FOK",
-                    "stopLossOnFill":    {"price": str(sl_price), "timeInForce": "GTC"},
-                    "takeProfitOnFill":  {"price": str(tp_price), "timeInForce": "GTC"}
+                    "type": "MARKET", "instrument": instrument,
+                    "units": str(units), "timeInForce": "FOK",
+                    "stopLossOnFill":   {"price": str(sl_price), "timeInForce": "GTC"},
+                    "takeProfitOnFill": {"price": str(tp_price), "timeInForce": "GTC"}
                 }},
                 timeout=15
             )
             data = r.json()
             log.info(f"Order response: {r.status_code} {str(data)[:200]}")
-
             if r.status_code in [200, 201]:
                 if "orderFillTransaction" in data:
-                    return {"success": True, "trade_id": data["orderFillTransaction"].get("id", "N/A")}
+                    return {"success": True, "trade_id": data["orderFillTransaction"].get("id")}
                 elif "orderCancelTransaction" in data:
-                    return {"success": False, "error": "Order cancelled: " + data["orderCancelTransaction"].get("reason", "Unknown")}
+                    return {"success": False, "error": "Cancelled: " + data["orderCancelTransaction"].get("reason", "?")}
                 return {"success": True}
             return {"success": False, "error": data.get("errorMessage", str(data))}
-
         except Exception as e:
             log.error(f"place_order error: {e}")
             return {"success": False, "error": str(e)}
 
     def close_position(self, instrument):
         try:
-            time.sleep(CALL_DELAY)
+            time.sleep(1.0)
             r = requests.put(
                 f"{self.base_url}/v3/accounts/{self.account_id}/positions/{instrument}/close",
                 headers=self.headers,
