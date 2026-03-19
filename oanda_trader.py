@@ -102,9 +102,7 @@ class OandaTrader:
         return None, None, None
 
     def get_position(self, instrument):
-        """Uses open trade count from cache to skip API call if no trades open."""
-        if self.get_open_trade_count() == 0:
-            return None   # no open trades — skip API call entirely
+        """Always check live position — never skip, stale cache causes opposite trades."""
         try:
             r = self._get(f"{self.base_url}/v3/accounts/{self.account_id}/positions/{instrument}")
             if r and r.status_code == 200:
