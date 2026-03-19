@@ -1,0 +1,15 @@
+{
+  "max_trades_day": 5,
+  "max_daily_loss": 74.0,
+  "signal_threshold": 5,
+  "signal_threshold_asian": 4,
+  "demo_mode": true,
+  "trade_gold": true,
+  "trade_gold_asian": true,
+  "max_consec_losses": 2,
+  "max_spread_gold": 999,
+  "max_spread_gold_asian": 999,
+  "strategy": "hybrid_cpr_breakout_gold",
+  "max_trades_asian": 2,
+  "max_trades_main": 3
+}
