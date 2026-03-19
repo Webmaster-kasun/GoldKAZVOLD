@@ -17,9 +17,12 @@ FIX: Accepts demo=True/False to use correct OANDA endpoint.
 """
 
 import os
+import time
 import requests
 import logging
 from cpr import CPRCalculator
+
+CALL_DELAY = 0.5  # seconds between API calls
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +39,7 @@ class SignalEngine:
         params = {"count": str(count), "granularity": granularity, "price": "M"}
         for attempt in range(3):
             try:
+                time.sleep(CALL_DELAY)
                 r = requests.get(url, headers=self.headers, params=params, timeout=10)
                 if r.status_code == 200:
                     candles = r.json()["candles"]
@@ -57,6 +61,7 @@ class SignalEngine:
             account_id = os.environ.get("OANDA_ACCOUNT_ID", "")
             url    = self.base_url + "/v3/accounts/" + account_id + "/pricing"
             params = {"instruments": instrument}
+            time.sleep(CALL_DELAY)
             r = requests.get(url, headers=self.headers, params=params, timeout=10)
             if r.status_code == 200:
                 prices = r.json().get("prices", [])
