@@ -162,6 +162,7 @@ def sync_closed_trades(trader, today, trade_log):
 
         url    = trader.base_url + "/v3/accounts/" + trader.account_id + "/trades"
         params = {"state": "CLOSED", "instrument": "XAU_USD", "count": "20"}
+        time.sleep(0.5)
         r = requests.get(url, headers=trader.headers, params=params, timeout=10)
         if r.status_code != 200:
             return
@@ -185,6 +186,7 @@ def sync_closed_trades(trader, today, trade_log):
         today["losses"] = losses
 
         open_url   = trader.base_url + "/v3/accounts/" + trader.account_id + "/openTrades"
+        time.sleep(0.5)
         or_        = requests.get(open_url, headers=trader.headers, timeout=10)
         open_count = len(or_.json().get("trades", [])) if or_.status_code == 200 else 0
         today["trades"] = trade_count + open_count
@@ -222,6 +224,7 @@ def get_atr_pips(trader, instrument, pip, multiplier=1.0):
     try:
         url    = trader.base_url + "/v3/instruments/" + instrument + "/candles"
         params = {"count": "30", "granularity": "H1", "price": "M"}
+        time.sleep(0.5)
         r      = requests.get(url, headers=trader.headers, params=params, timeout=10)
         if r.status_code != 200:
             return None
@@ -600,6 +603,7 @@ def run_bot():
         # ── MARGIN CAP ────────────────────────────────────────
         try:
             margin_url = trader.base_url + "/v3/accounts/" + trader.account_id
+            time.sleep(0.5)
             mr = requests.get(margin_url, headers=trader.headers, timeout=10)
             if mr.status_code == 200:
                 acct             = mr.json().get("account", {})
