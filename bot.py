@@ -365,8 +365,7 @@ def run_bot():
     with open(trade_log, "w") as f:
         json.dump(today, f, indent=2)
 
-    # ── SYNC TRADES FROM OANDA ───────────────────────────────
-    sync_closed_trades(trader, today, trade_log)
+    # Sync skipped — trade count tracked locally to save API calls
 
     # Daily loss limit DISABLED — demo mode, all trades run freely
     if today["trades"] >= settings["max_trades_day"]:
