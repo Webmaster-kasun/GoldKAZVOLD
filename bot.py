@@ -315,7 +315,8 @@ def run_bot():
         )
         return
 
-    current_balance = trader.get_balance()
+    # Balance already fetched during login — reuse it, avoid extra API call
+    current_balance = trader.last_balance
     mode            = "DEMO" if settings["demo_mode"] else "LIVE"
 
     # ── LOAD TODAY LOG ────────────────────────────────────────
