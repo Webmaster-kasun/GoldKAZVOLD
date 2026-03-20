@@ -1,12 +1,12 @@
 name: OANDA Gold CPR Bot
 
 on:
-  schedule:
-    # 9am–11pm SGT = 1am–3pm UTC  (SGT = UTC+8)
-    - cron: "*/10 1-14 * * 1-5"   # Mon–Fri 1am–2pm UTC (9am–10pm SGT)
-    - cron: "*/10 15 * * 1-5"     # Mon–Fri 3pm UTC (11pm SGT final window)
+  workflow_dispatch:  # Manual trigger only — Railway handles automatic scanning
 
-  workflow_dispatch:               # Manual trigger anytime
+# FIX 9: Removed cron schedule.
+# Railway runs bot.py continuously with its own 5-min loop.
+# Cron here caused 4-6 duplicate bots running simultaneously,
+# all hitting OANDA API and causing rate limit / key revocation.
 
 jobs:
   trade:
@@ -25,7 +25,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Gold CPR Bot
+      - name: Run Gold CPR Bot (single scan)
         env:
           OANDA_API_KEY:    ${{ secrets.OANDA_API_KEY }}
           OANDA_ACCOUNT_ID: ${{ secrets.OANDA_ACCOUNT_ID }}
@@ -41,4 +41,4 @@ jobs:
           path: |
             trades_*.json
             performance_log.txt
-          retention-days: 30
+          retention-days: 7
