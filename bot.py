@@ -162,7 +162,6 @@ def sync_closed_trades(trader, today, trade_log):
 
         url    = trader.base_url + "/v3/accounts/" + trader.account_id + "/trades"
         params = {"state": "CLOSED", "instrument": "XAU_USD", "count": "20"}
-        time.sleep(0.5)
         r = requests.get(url, headers=trader.headers, params=params, timeout=10)
         if r.status_code != 200:
             return
@@ -185,11 +184,10 @@ def sync_closed_trades(trader, today, trade_log):
         today["wins"]   = wins
         today["losses"] = losses
 
-        open_url   = trader.base_url + "/v3/accounts/" + trader.account_id + "/openTrades"
-        time.sleep(0.5)
-        or_        = requests.get(open_url, headers=trader.headers, timeout=10)
-        open_count = len(or_.json().get("trades", [])) if or_.status_code == 200 else 0
-        today["trades"] = trade_count + open_count
+        # ✅ FIX 1: Never overwrite today["trades"] from OANDA sync.
+        # The local counter is the source of truth for duplicate prevention.
+        # OANDA counts can be stale, timezone-mismatched, or miss open trades.
+        # We only sync W/L here — trade count stays from local increment.
 
         consec = 0
         for t in sorted(trades, key=lambda x: x.get("closeTime", ""), reverse=True):
@@ -211,7 +209,9 @@ def sync_closed_trades(trader, today, trade_log):
             latest = sorted(today_closed, key=lambda x: x.get("closeTime", ""))[-1]
             today["last_trade_close_time"]   = latest.get("closeTime", "")
             today["last_trade_close_result"] = "WIN" if float(latest.get("realizedPL", 0)) > 0 else "LOSS"
-            today["last_trade_entry_price"]  = float(latest.get("price", today.get("last_trade_entry_price") or 0))
+            # ✅ FIX 2: Don't overwrite last_trade_entry_price from sync.
+            # It's set correctly at order placement time. Sync would replace it
+            # with the closed trade's price, breaking the zone check for open trades.
 
         log.info("Synced " + str(trade_count + open_count) + " trades (closed=" + str(trade_count) +
                  " open=" + str(open_count) + ") W=" + str(wins) + " L=" + str(losses))
@@ -224,7 +224,6 @@ def get_atr_pips(trader, instrument, pip, multiplier=1.0):
     try:
         url    = trader.base_url + "/v3/instruments/" + instrument + "/candles"
         params = {"count": "30", "granularity": "H1", "price": "M"}
-        time.sleep(0.5)
         r      = requests.get(url, headers=trader.headers, params=params, timeout=10)
         if r.status_code != 200:
             return None
@@ -343,6 +342,10 @@ def run_bot():
             "last_trade_close_time":   None,
             "last_trade_close_result": None,
             "last_trade_entry_price":  None,
+            "last_trade_entry_time":      None,   # duplicate lock timestamp
+            "last_trade_entry_score":     0,      # score at last entry
+            "last_trade_entry_direction": "",     # direction at last entry
+            "score_dipped_after_trade":   False,  # legacy — kept for safety
             "asian_trades_today":      0,
             "main_trades_today":       0,
         }
@@ -365,7 +368,8 @@ def run_bot():
     with open(trade_log, "w") as f:
         json.dump(today, f, indent=2)
 
-    # Sync skipped — trade count tracked locally to save API calls
+    # ── SYNC TRADES FROM OANDA ───────────────────────────────
+    sync_closed_trades(trader, today, trade_log)
 
     # Daily loss limit DISABLED — demo mode, all trades run freely
     if today["trades"] >= settings["max_trades_day"]:
@@ -471,40 +475,132 @@ def run_bot():
                     ": ⏸️ Main window cap reached (" + str(main_trades) + "/" + str(window_cap) + ")")
                 continue
 
+        # ══════════════════════════════════════════════════════
         # ── SMART RE-ENTRY GUARD ─────────────────────────────
-        last_close_time   = today.get("last_trade_close_time")
-        last_close_result = today.get("last_trade_close_result")
-        last_entry_price  = today.get("last_trade_entry_price") or 0
+        # ══════════════════════════════════════════════════════
+        #
+        # Rules after any trade:
+        #
+        #  BLOCKED:
+        #   → SAME direction + score same or lower  = chasing, skip
+        #
+        #  ALLOWED:
+        #   → SAME direction + score 6 or 7         = stronger setup
+        #   → DIFFERENT direction + score ≥5         = reversal confirmed
+        #   → Price moved 500p+ from entry + score ≥5 = new zone
+        #
+        # DUPLICATE BUG FIX:
+        #   Hard 10-minute lock after any order placement.
+        #   This prevents multiple orders firing in same minute
+        #   when position check passes but fill not yet confirmed.
+        # ══════════════════════════════════════════════════════
 
-        if last_close_time:
+        last_entry_time      = today.get("last_trade_entry_time")
+        last_entry_score     = today.get("last_trade_entry_score", 0)
+        last_entry_direction = today.get("last_trade_entry_direction", "")
+        last_entry_price     = today.get("last_trade_entry_price") or 0
+        now_utc              = datetime.utcnow()
+
+        # ── HARD DUPLICATE LOCK (10 minutes) ─────────────────
+        # This is the primary fix for 4-6 orders per minute.
+        # After placing any order, block ALL new orders for 10 mins.
+        # Reason: position check can pass even when a trade was just
+        # placed (OANDA fill takes a few seconds to confirm).
+        # 10 mins > 2 scan cycles = guaranteed no duplicates.
+        if last_entry_time:
             try:
-                close_dt   = datetime.strptime(last_close_time[:16].replace("T", " "), "%Y-%m-%d %H:%M")
-                now_utc    = datetime.utcnow()
-                mins_since = (now_utc - close_dt).total_seconds() / 60
-
-                if mins_since < 30:
-                    remaining    = int(30 - mins_since)
-                    result_label = "after " + (last_close_result or "trade")
+                entry_dt         = datetime.strptime(last_entry_time[:16].replace("T", " "), "%Y-%m-%d %H:%M")
+                mins_since_entry = (now_utc - entry_dt).total_seconds() / 60
+                if mins_since_entry < 10:
+                    remaining = int(10 - mins_since_entry)
                     scan_results.append(
-                        config["emoji"] + " " + name + ": ⏳ " + str(remaining) +
-                        "min cooldown " + result_label + " (market settling)"
+                        config["emoji"] + " " + name +
+                        ": 🔒 Duplicate lock — " + str(remaining) + " min remaining"
+                    )
+                    log.info(name + " duplicate lock active — " + str(round(mins_since_entry,1)) + " min since last order")
+                    continue
+            except Exception as e:
+                log.warning("Duplicate lock error: " + str(e))
+
+        # ── SMART RE-ENTRY LOGIC ─────────────────────────────
+        # Only applies after at least one trade has been placed today
+        if last_entry_time and last_entry_score > 0 and last_entry_direction:
+            try:
+                asset_key_peek  = "XAUUSD_ASIAN" if is_asian_gold else config["asset"]
+                peek_score, peek_dir, _ = signals.analyze(asset=asset_key_peek)
+
+                same_direction  = (peek_dir == last_entry_direction)
+                price_now, _, _ = trader.get_price(name)
+                price_moved     = (abs((price_now or 0) - last_entry_price) / config["pip"]) >= 500 if last_entry_price else False
+
+                log.info(
+                    name + " re-entry check | last=" + last_entry_direction +
+                    "@score=" + str(last_entry_score) +
+                    " now=" + peek_dir + "@score=" + str(peek_score) +
+                    " same_dir=" + str(same_direction) +
+                    " price_moved=" + str(price_moved)
+                )
+
+                # ── RULE 1: Same direction + score same/lower = BLOCKED ──
+                if same_direction and peek_score <= last_entry_score and not price_moved:
+                    scan_results.append(
+                        config["emoji"] + " " + name +
+                        ": 🚫 Chasing blocked — same " + last_entry_direction +
+                        " dir, score " + str(peek_score) + "/7 ≤ last " +
+                        str(last_entry_score) + "/7, price unmoved"
                     )
                     continue
 
-                if last_entry_price:
-                    mid_price, _, _ = trader.get_price(name)
-                    if mid_price:
-                        price_diff = abs(mid_price - last_entry_price) / config["pip"]
-                        if price_diff < 500:
-                            needed = int(500 - price_diff)
-                            scan_results.append(
-                                config["emoji"] + " " + name + ": 🔲 Same zone — need " +
-                                str(needed) + "p more movement (current diff=" +
-                                str(int(price_diff)) + "p, need 500p)"
-                            )
-                            continue
+                # ── RULE 2: Same direction + score 6 or 7 = ALLOWED ──────
+                if same_direction and peek_score >= 6:
+                    log.info(name + " re-entry ALLOWED — same dir but stronger score " +
+                             str(peek_score) + "/7 ≥ 6")
+                    # Reset entry score so this new trade's score is tracked
+                    today["last_trade_entry_score"]     = 0
+                    today["last_trade_entry_direction"]  = ""
+                    with open(trade_log, "w") as f:
+                        json.dump(today, f, indent=2)
+                    # Fall through to trade
+
+                # ── RULE 3: Different direction + score ≥5 = ALLOWED ─────
+                elif not same_direction and peek_score >= 5:
+                    log.info(name + " re-entry ALLOWED — direction flipped " +
+                             last_entry_direction + " → " + peek_dir +
+                             " score=" + str(peek_score) + "/7")
+                    today["last_trade_entry_score"]     = 0
+                    today["last_trade_entry_direction"]  = ""
+                    with open(trade_log, "w") as f:
+                        json.dump(today, f, indent=2)
+                    # Fall through to trade
+
+                # ── RULE 4: Price 500p+ away + score ≥5 = ALLOWED ────────
+                elif price_moved and peek_score >= 5:
+                    log.info(name + " re-entry ALLOWED — new zone, price moved 500p+, score=" +
+                             str(peek_score) + "/7")
+                    today["last_trade_entry_score"]     = 0
+                    today["last_trade_entry_direction"]  = ""
+                    with open(trade_log, "w") as f:
+                        json.dump(today, f, indent=2)
+                    # Fall through to trade
+
+                # ── ALL RULES FAILED: block ────────────────────────────
+                else:
+                    reason = ""
+                    if same_direction:
+                        reason = "same dir " + peek_dir + ", score " + str(peek_score) + "/7"
+                        if not price_moved:
+                            reason += ", price unmoved"
+                    else:
+                        reason = "dir=" + peek_dir + " score=" + str(peek_score) + "/7 < 5"
+                    scan_results.append(
+                        config["emoji"] + " " + name +
+                        ": ⏳ Re-entry blocked — " + reason
+                    )
+                    continue
+
             except Exception as e:
                 log.warning("Re-entry guard error: " + str(e))
+                # On error fall through — don't block trading on exceptions
 
         # Spread check
         if is_asian_gold:
@@ -523,6 +619,8 @@ def run_bot():
         asset_key = "XAUUSD_ASIAN" if is_asian_gold else config["asset"]
         threshold = settings.get("signal_threshold_asian", 2) if is_asian_gold else settings["signal_threshold"]
 
+        # Note: if score-reset guard ran above, it already called signals.analyze()
+        # We call it again here to get the full details string for logging/alerts.
         score, direction, details = signals.analyze(asset=asset_key)
         log.info(name + ": score=" + str(score) + " dir=" + direction + " | " + details)
 
@@ -602,7 +700,6 @@ def run_bot():
         # ── MARGIN CAP ────────────────────────────────────────
         try:
             margin_url = trader.base_url + "/v3/accounts/" + trader.account_id
-            time.sleep(0.5)
             mr = requests.get(margin_url, headers=trader.headers, timeout=10)
             if mr.status_code == 200:
                 acct             = mr.json().get("account", {})
@@ -634,6 +731,12 @@ def run_bot():
             today["consec_losses"]         = 0
             today["breakeven_" + name]     = False
             today["last_trade_entry_price"] = price
+            # ✅ FIX 4: Record entry TIME so the 30-min cooldown activates
+            # immediately after placing — blocks duplicates on next scan.
+            today["last_trade_entry_time"]      = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+            today["last_trade_entry_score"]     = score        # re-entry guard
+            today["last_trade_entry_direction"] = direction    # re-entry guard
+            today["score_dipped_after_trade"]   = False        # legacy field — kept for safety
             if is_asian_gold:
                 today["asian_trades_today"] = today.get("asian_trades_today", 0) + 1
             else:
