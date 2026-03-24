@@ -11,7 +11,7 @@ Scoring (7 pts max):
   Check 7 — M15 Rejection   (0–1 pt):  Last M15 candle shows rejection at level
 
   Need 5/7 to trade (London/NY) | 4/7 Asian session
-  ATR filter: 500–10000p range (>10000p blocked, 5000-10000 = warning)
+  ATR filter: 500–5000p range (healthy volatility)
 
 FIX: Accepts demo=True/False to use correct OANDA endpoint.
 """
@@ -184,12 +184,9 @@ class SignalEngine:
             min_atr = 300 if is_asian else 500
             if atr_pips < min_atr:
                 return 0, "NONE", "ATR=" + str(atr_pips) + "p — too quiet, skip"
-            if atr_pips > 10000:
-                return 0, "NONE", "ATR=" + str(atr_pips) + "p — extreme volatility, skip"
-            elif atr_pips > 5000:
-                reasons.append("⚠️ ATR=" + str(atr_pips) + "p — high volatility (trade with caution)")
-            else:
-                reasons.append("✅ ATR=" + str(atr_pips) + "p — healthy volatility")
+            if atr_pips > 5000:
+                return 0, "NONE", "ATR=" + str(atr_pips) + "p — too volatile, skip"
+            reasons.append("✅ ATR=" + str(atr_pips) + "p — healthy volatility")
 
         # ── H4 TREND FILTER (hard block) ─────────────────────
         h4_direction = "NONE"
