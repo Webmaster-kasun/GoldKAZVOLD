@@ -3,7 +3,8 @@ Gold Signal Engine — 7-Check Professional Entry System
 =======================================================
 Scoring (7 pts max):
   Check 1 — CPR Breakout    (0–2 pts): Price above TC=BUY, below BC=SELL
-  Check 2 — H4 Trend        (block):   H4 EMA20 vs EMA50 — hard block if against trend
+  Check 2 — H4 Trend        (varies):  London/NY: hard block (BLOCKED direction)
+                                        Asian:     -1 pt penalty only
   Check 3 — EMA Alignment   (0–1 pt):  H1 EMA20/50 agree with direction
   Check 4 — RSI Momentum    (0–1 pt):  RSI > 55 BUY / RSI < 45 SELL
   Check 5 — PDH/PDL Clear   (0–1 pt):  Price clear of Prior Day High/Low (200p+)
@@ -11,9 +12,14 @@ Scoring (7 pts max):
   Check 7 — M15 Rejection   (0–1 pt):  Last M15 candle shows rejection at level
 
   Need 5/7 to trade (London/NY) | 4/7 Asian session
-  ATR filter: 500–5000p range (healthy volatility)
+  ATR filter: 300–10000p (Asian) | 500–10000p (London/NY)
+              Warning zone 5000–10000p
 
-FIX: Accepts demo=True/False to use correct OANDA endpoint.
+  direction return values:
+    "BUY"     — tradeable long signal
+    "SELL"    — tradeable short signal
+    "BLOCKED" — London/NY H4 hard block; full score shown for info only
+    "NONE"    — no CPR breakout or bad data
 """
 
 import os
@@ -120,19 +126,17 @@ class SignalEngine:
 
     def _check_m15_rejection(self, direction):
         """
-        Check if last M15 candle shows a rejection wick
-        SELL: upper wick > 40% of candle range = rejection at top
-        BUY:  lower wick > 40% of candle range = rejection at bottom
+        Check if last M15 candle shows a rejection wick.
+        SELL: upper wick > 40% of candle range
+        BUY:  lower wick > 40% of candle range
         """
         try:
             closes, highs, lows, opens, _ = self._fetch_candles("XAU_USD", "M15", 5)
             if not closes or len(closes) < 2:
                 return False, "No M15 data"
 
-            h = highs[-1]
-            l = lows[-1]
-            o = opens[-1]
-            c = closes[-1]
+            h = highs[-1];  l = lows[-1]
+            o = opens[-1];  c = closes[-1]
             total_range = h - l
             if total_range < 0.01:
                 return False, "M15 candle too small"
@@ -147,10 +151,9 @@ class SignalEngine:
             elif direction == "BUY" and lower_pct >= 0.40:
                 return True, "M15 lower wick=" + str(round(lower_pct*100)) + "% — rejection at bottom ✅"
             else:
-                if direction == "SELL":
-                    return False, "M15 upper wick only " + str(round(upper_pct*100)) + "% — no rejection"
-                else:
-                    return False, "M15 lower wick only " + str(round(lower_pct*100)) + "% — no rejection"
+                pct = round(upper_pct*100) if direction == "SELL" else round(lower_pct*100)
+                side = "upper" if direction == "SELL" else "lower"
+                return False, "M15 " + side + " wick only " + str(pct) + "% — no rejection"
         except Exception as e:
             log.warning("M15 rejection error: " + str(e))
             return False, "M15 check failed"
@@ -161,13 +164,17 @@ class SignalEngine:
         return self._analyze_gold(is_asian=False)
 
     def _analyze_gold(self, is_asian=False):
+        """
+        Always runs all 7 checks regardless of H4 direction.
+        Returns (score, direction, details_string).
+        """
         reasons   = []
         score     = 0
         direction = "NONE"
-        threshold = 4 if is_asian else 5
+        blocked   = False
 
-        h4_closes, _, _, _, _              = self._fetch_candles("XAU_USD", "H4", 60)
-        h1_closes, h1_highs, h1_lows, _, _ = self._fetch_candles("XAU_USD", "H1", 60)
+        h4_closes, _, _, _, _               = self._fetch_candles("XAU_USD", "H4", 60)
+        h1_closes, h1_highs, h1_lows, _, _  = self._fetch_candles("XAU_USD", "H1", 60)
 
         if not h1_closes:
             return 0, "NONE", "No price data"
@@ -184,11 +191,14 @@ class SignalEngine:
             min_atr = 300 if is_asian else 500
             if atr_pips < min_atr:
                 return 0, "NONE", "ATR=" + str(atr_pips) + "p — too quiet, skip"
+            if atr_pips > 10000:
+                return 0, "NONE", "ATR=" + str(atr_pips) + "p — extreme volatility, skip"
             if atr_pips > 5000:
-                return 0, "NONE", "ATR=" + str(atr_pips) + "p — too volatile, skip"
-            reasons.append("✅ ATR=" + str(atr_pips) + "p — healthy volatility")
+                reasons.append("⚠️ ATR=" + str(atr_pips) + "p — elevated (warning, proceed with caution)")
+            else:
+                reasons.append("✅ ATR=" + str(atr_pips) + "p — healthy volatility")
 
-        # ── H4 TREND FILTER (hard block) ─────────────────────
+        # ── H4 TREND DIRECTION ────────────────────────────────
         h4_direction = "NONE"
         if len(h4_closes) >= 50:
             h4_ema20 = self._ema(h4_closes, 20)[-1]
@@ -197,7 +207,8 @@ class SignalEngine:
                 h4_direction = "BUY"
             elif h4_ema20 < h4_ema50:
                 h4_direction = "SELL"
-            log.info("H4 trend=" + h4_direction + " EMA20=" + str(round(h4_ema20,2)) + " EMA50=" + str(round(h4_ema50,2)))
+            log.info("H4 trend=" + h4_direction + " EMA20=" + str(round(h4_ema20, 2))
+                     + " EMA50=" + str(round(h4_ema50, 2)))
         else:
             return 0, "NONE", "H4 data insufficient — skipping unfiltered trade"
 
@@ -206,11 +217,8 @@ class SignalEngine:
         if not cpr:
             return 0, "NONE", "CPR levels unavailable"
 
-        tc = cpr["tc"]
-        bc = cpr["bc"]
-        r1 = cpr["r1"]
-        s1 = cpr["s1"]
-
+        tc = cpr["tc"];  bc = cpr["bc"]
+        r1 = cpr["r1"];  s1 = cpr["s1"]
         log.info("CPR TC=" + str(tc) + " BC=" + str(bc) + " price=" + str(price))
 
         if price > tc:
@@ -225,28 +233,41 @@ class SignalEngine:
             reasons.append("❌ Price inside CPR (" + str(bc) + "–" + str(tc) + ") — no trade")
             return 0, "NONE", " | ".join(reasons)
 
-        # ── H4 HARD BLOCK ────────────────────────────────────
-        if h4_direction != "NONE" and direction != h4_direction:
-            reasons.append("🚫 H4 trend=" + h4_direction + " blocks " + direction + " signal")
-            return score, "NONE", " | ".join(reasons)
-        elif h4_direction != "NONE":
-            reasons.append("✅ H4 trend=" + h4_direction + " confirms direction")
+        # ── CHECK 2: H4 TREND ────────────────────────────────
+        # Asian:     -1 pt penalty (soft, trade can still fire if score passes)
+        # London/NY: hard block (direction → BLOCKED, all checks still run for info)
+        h4_against = (h4_direction != "NONE" and direction != h4_direction)
+        if h4_against:
+            if is_asian:
+                score = max(0, score - 1)
+                reasons.append("⚠️ H4 trend=" + h4_direction + " against " + direction
+                               + " — Asian penalty -1pt (score=" + str(score) + ")")
+            else:
+                blocked = True
+                reasons.append("🚫 H4 trend=" + h4_direction + " blocks " + direction
+                               + " (London/NY hard block — showing full score for info)")
+        else:
+            if h4_direction != "NONE":
+                reasons.append("✅ H4 trend=" + h4_direction + " confirms direction")
 
         # ── CHECK 3: EMA ALIGNMENT (0–1 pt) ──────────────────
+        ema20 = price  # fallback if not enough data
         if len(h1_closes) >= 50:
             ema20 = self._ema(h1_closes, 20)[-1]
             ema50 = self._ema(h1_closes, 50)[-1]
-            log.info("EMA20=" + str(round(ema20,2)) + " EMA50=" + str(round(ema50,2)))
+            log.info("EMA20=" + str(round(ema20, 2)) + " EMA50=" + str(round(ema50, 2)))
             if direction == "BUY" and price > ema20 and ema20 > ema50:
                 score += 1
-                reasons.append("✅ EMA: price > EMA20=" + str(round(ema20,2)) + " > EMA50=" + str(round(ema50,2)) + " (1 pt)")
+                reasons.append("✅ EMA: price > EMA20=" + str(round(ema20, 2))
+                               + " > EMA50=" + str(round(ema50, 2)) + " (1 pt)")
             elif direction == "SELL" and price < ema20 and ema20 < ema50:
                 score += 1
-                reasons.append("✅ EMA: price < EMA20=" + str(round(ema20,2)) + " < EMA50=" + str(round(ema50,2)) + " (1 pt)")
+                reasons.append("✅ EMA: price < EMA20=" + str(round(ema20, 2))
+                               + " < EMA50=" + str(round(ema50, 2)) + " (1 pt)")
             else:
-                reasons.append("❌ EMA conflict: EMA20=" + str(round(ema20,2)) + " EMA50=" + str(round(ema50,2)) + " (0 pts)")
+                reasons.append("❌ EMA conflict: EMA20=" + str(round(ema20, 2))
+                               + " EMA50=" + str(round(ema50, 2)) + " (0 pts)")
         else:
-            ema20 = price
             reasons.append("❌ EMA: not enough H1 data (0 pts)")
 
         # ── CHECK 4: RSI MOMENTUM (0–1 pt) ───────────────────
@@ -271,23 +292,23 @@ class SignalEngine:
         if pdh and pdl:
             pip = 0.01
             if direction == "SELL":
-                dist_from_pdh = (pdh - price) / pip
-                if dist_from_pdh > 200:
+                dist = (pdh - price) / pip
+                if dist > 200:
                     score += 1
-                    reasons.append("✅ PDH=" + str(pdh) + " | price " + str(int(dist_from_pdh)) + "p below — clear for SELL (1 pt)")
-                elif dist_from_pdh < 0:
-                    reasons.append("❌ Price ABOVE PDH=" + str(pdh) + " — SELL too risky near resistance (0 pts)")
+                    reasons.append("✅ PDH=" + str(pdh) + " | price " + str(int(dist)) + "p below — clear for SELL (1 pt)")
+                elif dist < 0:
+                    reasons.append("❌ Price ABOVE PDH=" + str(pdh) + " — SELL risky (0 pts)")
                 else:
-                    reasons.append("❌ Price only " + str(int(dist_from_pdh)) + "p below PDH=" + str(pdh) + " — too close (0 pts)")
+                    reasons.append("❌ Price only " + str(int(dist)) + "p below PDH=" + str(pdh) + " — too close (0 pts)")
             elif direction == "BUY":
-                dist_from_pdl = (price - pdl) / pip
-                if dist_from_pdl > 200:
+                dist = (price - pdl) / pip
+                if dist > 200:
                     score += 1
-                    reasons.append("✅ PDL=" + str(pdl) + " | price " + str(int(dist_from_pdl)) + "p above — clear for BUY (1 pt)")
-                elif dist_from_pdl < 0:
-                    reasons.append("❌ Price BELOW PDL=" + str(pdl) + " — BUY too risky near support (0 pts)")
+                    reasons.append("✅ PDL=" + str(pdl) + " | price " + str(int(dist)) + "p above — clear for BUY (1 pt)")
+                elif dist < 0:
+                    reasons.append("❌ Price BELOW PDL=" + str(pdl) + " — BUY risky (0 pts)")
                 else:
-                    reasons.append("❌ Price only " + str(int(dist_from_pdl)) + "p above PDL=" + str(pdl) + " — too close (0 pts)")
+                    reasons.append("❌ Price only " + str(int(dist)) + "p above PDL=" + str(pdl) + " — too close (0 pts)")
         else:
             reasons.append("⚠️ PDH/PDL unavailable — skipping check (0 pts)")
 
@@ -298,7 +319,7 @@ class SignalEngine:
             score += 1
             reasons.append("✅ EMA20 dist=" + str(int(ema20_dist)) + "p ≤ 800p — not overextended (1 pt)")
         else:
-            reasons.append("❌ EMA20 dist=" + str(int(ema20_dist)) + "p > 800p — overextended, likely reversal (0 pts)")
+            reasons.append("❌ EMA20 dist=" + str(int(ema20_dist)) + "p > 800p — overextended (0 pts)")
 
         # ── CHECK 7: M15 REJECTION CANDLE (0–1 pt) ───────────
         m15_ok, m15_reason = self._check_m15_rejection(direction)
@@ -306,8 +327,13 @@ class SignalEngine:
             score += 1
             reasons.append("✅ M15 rejection confirmed: " + m15_reason + " (1 pt)")
         else:
-            reasons.append("❌ M15: " + m15_reason + " (0 pts) — no confirmation yet")
+            reasons.append("❌ M15: " + m15_reason + " (0 pts)")
 
         reasons.append("R1=" + str(r1) + " S1=" + str(s1))
-        log.info("Score=" + str(score) + "/7 direction=" + direction + " threshold=" + str(threshold))
-        return score, direction, " | ".join(reasons)
+
+        # If London/NY hard block fired, return BLOCKED so bot knows not to trade
+        # but still has the full score for the Telegram message
+        final_direction = "BLOCKED" if blocked else direction
+
+        log.info("Score=" + str(score) + "/7 direction=" + final_direction)
+        return score, final_direction, " | ".join(reasons)
