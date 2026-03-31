@@ -12,6 +12,10 @@ FIX LOG:
   FIX 5 - sync no longer overwrites last_trade_entry_price
   FIX 6 - Smart re-entry guard (4 rules)
   FIX 7 - Daily summary at 11pm SGT
+  FIX 8 - H4 block: Asian = -1pt penalty (not a kill); London/NY = BLOCKED direction
+         All 7 checks always run; full score always shown in Telegram
+  FIX 9 - Eliminated double signals.analyze() call in re-entry guard (halves API calls)
+  FIX 10 - Eliminated duplicate "Watching" alert; BLOCKED handled by main scan alert only
 """
 
 import os
@@ -453,49 +457,6 @@ def run_bot():
             except Exception as e:
                 log.warning("Duplicate lock error: " + str(e))
 
-        # FIX 6: Smart re-entry rules
-        if last_entry_time and last_entry_score > 0 and last_entry_direction:
-            try:
-                ak                      = "XAUUSD_ASIAN" if is_asian_gold else config["asset"]
-                peek_score, peek_dir, _ = signals.analyze(asset=ak)
-                same_dir                = (peek_dir == last_entry_direction)
-                price_now, _, _         = trader.get_price(name)
-                price_moved             = (abs((price_now or 0) - last_entry_price) / config["pip"]) >= 500 if last_entry_price else False
-
-                log.info(name + " re-entry | last=" + last_entry_direction + "@" + str(last_entry_score) +
-                         " now=" + peek_dir + "@" + str(peek_score) +
-                         " same=" + str(same_dir) + " moved=" + str(price_moved))
-
-                if same_dir and peek_score <= last_entry_score and not price_moved:
-                    scan_results.append(config["emoji"] + " " + name +
-                        ": 🚫 Chasing — same " + last_entry_direction +
-                        " score " + str(peek_score) + " <= " + str(last_entry_score))
-                    continue
-                elif same_dir and peek_score >= 6:
-                    log.info(name + " ALLOWED — stronger score " + str(peek_score))
-                    today["last_trade_entry_score"]     = 0
-                    today["last_trade_entry_direction"] = ""
-                elif not same_dir and peek_score >= 5:
-                    log.info(name + " ALLOWED — direction flip to " + peek_dir)
-                    today["last_trade_entry_score"]     = 0
-                    today["last_trade_entry_direction"] = ""
-                elif price_moved and peek_score >= 5:
-                    log.info(name + " ALLOWED — new zone 500p+")
-                    today["last_trade_entry_score"]     = 0
-                    today["last_trade_entry_direction"] = ""
-                else:
-                    reason = ("same dir " + str(peek_score) + "/7" if same_dir
-                              else peek_dir + " score=" + str(peek_score) + "/7 < 5")
-                    scan_results.append(config["emoji"] + " " + name +
-                        ": ⏳ Re-entry blocked — " + reason)
-                    continue
-
-                with open(trade_log, "w") as f:
-                    json.dump(today, f, indent=2)
-
-            except Exception as e:
-                log.warning("Re-entry guard error: " + str(e))
-
         max_spread            = settings.get("max_spread_gold_asian", 999) if is_asian_gold else settings.get("max_spread_gold", 999)
         spread_ok, spread_val = check_spread(trader, name, max_spread, config["pip"])
 
@@ -507,6 +468,7 @@ def run_bot():
         asset_key = "XAUUSD_ASIAN" if is_asian_gold else config["asset"]
         threshold = settings.get("signal_threshold_asian", 4) if is_asian_gold else settings["signal_threshold"]
 
+        # Single analyze() call — result reused for both re-entry guard and trade logic
         score, direction, details = signals.analyze(asset=asset_key)
         log.info(name + ": score=" + str(score) + " dir=" + direction + " | " + details)
 
@@ -515,14 +477,65 @@ def run_bot():
                 ": Spread " + str(round(spread_val, 1)) + " pips | Score: " + str(score) + "/7")
             continue
 
-        if is_asian_gold and score >= 2 and direction == "NONE":
-            scan_results.append(config["emoji"] + " " + name + ": Watching for breakout (" + str(score) + "/7)")
-            cpr_lvls  = cpr_calc.get_levels("XAU_USD")
-            watch_msg = "Watching for breakout\nScore: " + str(score) + "/7 need " + str(threshold) + "\n"
-            if cpr_lvls:
-                watch_msg += "TC=" + str(cpr_lvls["tc"]) + " BC=" + str(cpr_lvls["bc"]) + "\n"
-            watch_msg += details.replace(" | ", "\n")
-            alert.send(watch_msg)
+        # FIX 6: Smart re-entry rules (uses already-fetched score/direction — no second API call)
+        if last_entry_time and last_entry_score > 0 and last_entry_direction:
+            try:
+                # Treat BLOCKED same as its underlying direction for same-dir check
+                peek_dir_eff  = last_entry_direction if direction == "BLOCKED" else direction
+                same_dir      = (peek_dir_eff == last_entry_direction)
+                price_now, _, _ = trader.get_price(name)
+                price_moved   = (abs((price_now or 0) - last_entry_price) / config["pip"]) >= 500 if last_entry_price else False
+
+                log.info(name + " re-entry | last=" + last_entry_direction + "@" + str(last_entry_score) +
+                         " now=" + direction + "@" + str(score) +
+                         " same=" + str(same_dir) + " moved=" + str(price_moved))
+
+                if same_dir and score <= last_entry_score and not price_moved:
+                    scan_results.append(config["emoji"] + " " + name +
+                        ": 🚫 Chasing — same " + last_entry_direction +
+                        " score " + str(score) + " <= " + str(last_entry_score))
+                    continue
+                elif same_dir and score >= 6:
+                    log.info(name + " ALLOWED — stronger score " + str(score))
+                    today["last_trade_entry_score"]     = 0
+                    today["last_trade_entry_direction"] = ""
+                elif not same_dir and score >= 5 and direction not in ("NONE", "BLOCKED"):
+                    log.info(name + " ALLOWED — direction flip to " + direction)
+                    today["last_trade_entry_score"]     = 0
+                    today["last_trade_entry_direction"] = ""
+                elif price_moved and score >= 5:
+                    log.info(name + " ALLOWED — new zone 500p+")
+                    today["last_trade_entry_score"]     = 0
+                    today["last_trade_entry_direction"] = ""
+                else:
+                    reason = ("same dir " + str(score) + "/7" if same_dir
+                              else direction + " score=" + str(score) + "/7 < 5")
+                    scan_results.append(config["emoji"] + " " + name +
+                        ": ⏳ Re-entry blocked — " + reason)
+                    continue
+
+                with open(trade_log, "w") as f:
+                    json.dump(today, f, indent=2)
+
+            except Exception as e:
+                log.warning("Re-entry guard error: " + str(e))
+
+        # ── BLOCKED: London/NY H4 hard block ─────────────────────────────────
+        # Show full score info in scan summary; main scan alert handles Telegram.
+        if direction == "BLOCKED":
+            scan_results.append(
+                config["emoji"] + " " + name + ": 🚫 H4 blocked | " + str(score) + "/7"
+            )
+            # details already contains the full breakdown — let main scan alert send it
+            # (do NOT send a separate alert here; avoids double-message every 5 min)
+            continue
+
+        # ── Asian watching state ──────────────────────────────────────────────
+        # direction == "NONE" with score >= 1 means price is in CPR or H4 blocked
+        # After signals.py fix, Asian H4 conflict = -1pt penalty + direction stays BUY/SELL
+        # So "NONE" here genuinely means price is inside CPR (no breakout yet)
+        if is_asian_gold and score == 0 and direction == "NONE":
+            scan_results.append(config["emoji"] + " " + name + ": Inside CPR — watching")
             continue
 
         if score < threshold or direction == "NONE":
@@ -664,6 +677,12 @@ def run_bot():
         today["last_alert_direction"] = direction
         with open(trade_log, "w") as f:
             json.dump(today, f, indent=2)
+
+        # Build signal detail block — shown when there's a real signal or block to report
+        signal_detail = ""
+        if score > 0 and details:
+            signal_detail = "--- Signals ---\n" + details.replace(" | ", "\n") + "\n"
+
         alert.send(
             "🥇 GOLD BOT Scan! " + mode + "\n"
             "Time: " + now.strftime("%H:%M SGT") + " | " + session + "\n"
@@ -676,7 +695,8 @@ def run_bot():
             "-------------------------\n"
             + cpr_line +
             "--- Setups ---\n"
-            + summary
+            + summary + "\n"
+            + signal_detail
         )
     else:
         log.info("Scan silent — next alert in " + str(60 - mins_since_alert) + " mins")
