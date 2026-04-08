@@ -5,17 +5,22 @@ Pair:     XAU/USD (Gold only)
 Sessions: Asian (9am-1pm SGT) | London (2pm-7pm SGT) | NY (8pm-11pm SGT)
 
 FIX LOG:
-  FIX 1 - Removed trade_journal import (next phase)
-  FIX 2 - Fixed open_count NameError crash in sync
-  FIX 3 - Hard 10-min duplicate lock (stops 4-6 orders/min bug)
-  FIX 4 - sync no longer overwrites today["trades"] counter
-  FIX 5 - sync no longer overwrites last_trade_entry_price
-  FIX 6 - Smart re-entry guard (4 rules)
-  FIX 7 - Daily summary at 11pm SGT
-  FIX 8 - H4 block: Asian = -1pt penalty (not a kill); London/NY = BLOCKED direction
-         All 7 checks always run; full score always shown in Telegram
-  FIX 9 - Eliminated double signals.analyze() call in re-entry guard (halves API calls)
+  FIX 1  - Removed trade_journal import (next phase)
+  FIX 2  - Fixed open_count NameError crash in sync
+  FIX 3  - Hard 10-min duplicate lock (stops 4-6 orders/min bug)
+  FIX 4  - sync no longer overwrites today["trades"] counter
+  FIX 5  - sync no longer overwrites last_trade_entry_price
+  FIX 6  - Smart re-entry guard (4 rules)
+  FIX 7  - Daily summary at 11pm SGT
+  FIX 8  - H4 block: Asian = -1pt penalty (not a kill); London/NY = BLOCKED direction
+           All 7 checks always run; full score always shown in Telegram
+  FIX 9  - Eliminated double signals.analyze() call in re-entry guard (halves API calls)
   FIX 10 - Eliminated duplicate "Watching" alert; BLOCKED handled by main scan alert only
+  FIX 11 - TP set to 2200p, SL set to 1200p (user-specified, replaces ATR-based 500-600p SL)
+           Dynamic CPR target retained only when within TP range
+  FIX 12 - Replaced hard 10-min time lock with M30 Win Candle Lock:
+           After a TP win, block new entries until the M30 candle that
+           the win closed on has fully passed AND the next candle opens.
 """
 
 import os
@@ -155,6 +160,20 @@ def sync_closed_trades(trader, today, trade_log):
             today["last_trade_close_time"]   = latest.get("closeTime", "")
             today["last_trade_close_result"] = "WIN" if float(latest.get("realizedPL", 0)) > 0 else "LOSS"
             # FIX 5: Do NOT overwrite last_trade_entry_price here
+
+            # FIX 12: Win Candle Lock — record M30 candle-close boundary of the latest win
+            if float(latest.get("realizedPL", 0)) > 0:
+                try:
+                    from datetime import timezone as _tz
+                    close_raw    = latest.get("closeTime", "")
+                    close_dt     = datetime.strptime(close_raw[:16], "%Y-%m-%dT%H:%M").replace(tzinfo=_tz.utc)
+                    floor_min    = (close_dt.minute // 30) * 30
+                    candle_start = close_dt.replace(minute=floor_min, second=0, microsecond=0)
+                    candle_close = candle_start + timedelta(minutes=30)
+                    today["last_win_candle_close"] = candle_close.strftime("%Y-%m-%dT%H:%M")
+                    log.info("Win Candle Lock set: block until M30=" + today["last_win_candle_close"])
+                except Exception as _we:
+                    log.warning("Win candle lock set error: " + str(_we))
 
         # FIX 2: open_count removed — was undefined after FIX 4
         log.info("Synced W=" + str(wins) + " L=" + str(losses) + " consec=" + str(consec))
@@ -317,6 +336,8 @@ def run_bot():
             "last_trade_entry_direction": "",
             "asian_trades_today":       0,
             "main_trades_today":        0,
+            "last_win_candle_close":    None,
+            "last_entry_candle":        None,
         }
         with open(trade_log, "w") as f:
             json.dump(today, f, indent=2)
@@ -443,19 +464,42 @@ def run_bot():
         last_entry_price     = today.get("last_trade_entry_price") or 0
         now_utc              = datetime.utcnow()
 
-        # FIX 3: Hard 10-min duplicate lock
-        if last_entry_time:
+        # FIX 12: Win Candle Lock — after a TP win, block until the M30 candle
+        # that closed the win has FULLY passed AND a new candle has confirmed.
+        # No cooldown timers — uses candle boundary only.
+        last_win_candle = today.get("last_win_candle_close")  # stored as "YYYY-MM-DDTHH:MM" (M30 boundary)
+        if last_win_candle:
             try:
-                entry_dt  = datetime.strptime(last_entry_time[:16].replace("T", " "), "%Y-%m-%d %H:%M")
-                mins_since = (now_utc - entry_dt).total_seconds() / 60
-                if mins_since < 10:
-                    remaining = int(10 - mins_since)
+                # Current M30 candle start (floor to 30-min boundary)
+                m30_floor = now_utc.replace(minute=(now_utc.minute // 30) * 30, second=0, microsecond=0)
+                win_candle_dt = datetime.strptime(last_win_candle, "%Y-%m-%dT%H:%M")
+                # Block if we are still ON or BEFORE the win-candle's next candle
+                # i.e. allow only when current M30 candle START is strictly AFTER win candle close
+                if m30_floor <= win_candle_dt:
+                    remaining_secs = int((win_candle_dt - m30_floor).total_seconds()) + 1
+                    remaining_min  = max(1, remaining_secs // 60)
                     scan_results.append(config["emoji"] + " " + name +
-                        ": 🔒 Duplicate lock — " + str(remaining) + " min remaining")
-                    log.info(name + " duplicate lock — " + str(round(mins_since, 1)) + " min since last order")
+                        ": 🔒 Win Candle Lock — next candle in ~" + str(remaining_min) + " min")
+                    log.info(name + " Win Candle Lock — win closed on M30=" +
+                             last_win_candle + ", current M30=" + m30_floor.strftime("%Y-%m-%dT%H:%M"))
                     continue
             except Exception as e:
-                log.warning("Duplicate lock error: " + str(e))
+                log.warning("Win Candle Lock error: " + str(e))
+
+        # Legacy duplicate-entry guard (non-win scenario): block same-direction re-entry
+        # within the same M30 candle to prevent spam from 5-min scan loops
+        last_entry_candle = today.get("last_entry_candle")  # stored as "YYYY-MM-DDTHH:MM" (M30 boundary)
+        if last_entry_candle:
+            try:
+                m30_floor2    = now_utc.replace(minute=(now_utc.minute // 30) * 30, second=0, microsecond=0)
+                entry_candle_dt = datetime.strptime(last_entry_candle, "%Y-%m-%dT%H:%M")
+                if m30_floor2 == entry_candle_dt:
+                    scan_results.append(config["emoji"] + " " + name +
+                        ": 🔒 Same-candle lock — wait for next M30")
+                    log.info(name + " same-candle duplicate lock on M30=" + last_entry_candle)
+                    continue
+            except Exception as e:
+                log.warning("Same-candle lock error: " + str(e))
 
         max_spread            = settings.get("max_spread_gold_asian", 999) if is_asian_gold else settings.get("max_spread_gold", 999)
         spread_ok, spread_val = check_spread(trader, name, max_spread, config["pip"])
@@ -548,18 +592,20 @@ def run_bot():
         price, _, _ = trader.get_price(name)
         raw_atr     = get_atr_pips(trader, name, config["pip"], multiplier=1.0)
         pip         = config["pip"]
-        stop_pips   = max(500, min(raw_atr, 600)) if raw_atr else 600
+        # FIX 11: Fixed SL=1200p, TP=2200p (user-specified)
+        stop_pips   = 1200
         size        = calc_position_size(current_balance, stop_pips, pip, score, price)
 
-        tp_pips  = 1800
-        tp_label = "Fixed 1800p (1:3 R:R)"
+        tp_pips  = 2200
+        tp_label = "Fixed 2200p (1:1.8 R:R)"
         if cpr_levels and price:
             r1           = cpr_levels.get("r1", 0)
             s1           = cpr_levels.get("s1", 0)
             target_level = r1 if direction == "BUY" else s1
             if target_level:
                 dist = abs(target_level - price) / pip
-                if stop_pips * 2 <= dist <= stop_pips * 4:
+                # Only use dynamic CPR target if it falls within the TP window
+                if 1800 <= dist <= 3000:
                     tp_pips  = int(dist)
                     tp_label = ("R1=" + str(r1) if direction == "BUY" else "S1=" + str(s1)) + " (dynamic)"
 
@@ -595,13 +641,16 @@ def run_bot():
         )
 
         if result["success"]:
+            now_utc_entry = datetime.utcnow()
+            m30_entry     = now_utc_entry.replace(minute=(now_utc_entry.minute // 30) * 30, second=0, microsecond=0)
             today["trades"]                    += 1
             today["consec_losses"]              = 0
             today["breakeven_" + name]          = False
             today["last_trade_entry_price"]     = price
-            today["last_trade_entry_time"]      = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+            today["last_trade_entry_time"]      = now_utc_entry.strftime("%Y-%m-%dT%H:%M:%S")
             today["last_trade_entry_score"]     = score
             today["last_trade_entry_direction"] = direction
+            today["last_entry_candle"]          = m30_entry.strftime("%Y-%m-%dT%H:%M")
             if is_asian_gold:
                 today["asian_trades_today"] = today.get("asian_trades_today", 0) + 1
             else:
