@@ -221,14 +221,32 @@ class SignalEngine:
         r1 = cpr["r1"];  s1 = cpr["s1"]
         log.info("CPR TC=" + str(tc) + " BC=" + str(bc) + " price=" + str(price))
 
-        if price > tc:
+        # Require minimum buffer beyond TC/BC to avoid fakeout entries at the boundary
+        # Asian: 30p buffer | London/NY: 60p buffer
+        BREAKOUT_BUFFER = 30 if is_asian else 60
+        buffer_val = BREAKOUT_BUFFER * 0.01
+
+        breakout_pips_buy  = round((price - tc) / 0.01) if price > tc else 0
+        breakout_pips_sell = round((bc - price) / 0.01) if price < bc else 0
+
+        if price > tc and breakout_pips_buy >= BREAKOUT_BUFFER:
             direction = "BUY"
             score    += 2
-            reasons.append("✅ Price " + str(price) + " above TC=" + str(tc) + " → BUY (2 pts)")
-        elif price < bc:
+            reasons.append("✅ Price " + str(price) + " above TC=" + str(tc)
+                           + " by " + str(breakout_pips_buy) + "p → BUY (2 pts)")
+        elif price < bc and breakout_pips_sell >= BREAKOUT_BUFFER:
             direction = "SELL"
             score    += 2
-            reasons.append("✅ Price " + str(price) + " below BC=" + str(bc) + " → SELL (2 pts)")
+            reasons.append("✅ Price " + str(price) + " below BC=" + str(bc)
+                           + " by " + str(breakout_pips_sell) + "p → SELL (2 pts)")
+        elif price > tc:
+            reasons.append("❌ Price above TC=" + str(tc) + " but only " + str(breakout_pips_buy)
+                           + "p buffer — too close, fakeout risk (need " + str(BREAKOUT_BUFFER) + "p)")
+            return 0, "NONE", " | ".join(reasons)
+        elif price < bc:
+            reasons.append("❌ Price below BC=" + str(bc) + " but only " + str(breakout_pips_sell)
+                           + "p buffer — too close, fakeout risk (need " + str(BREAKOUT_BUFFER) + "p)")
+            return 0, "NONE", " | ".join(reasons)
         else:
             reasons.append("❌ Price inside CPR (" + str(bc) + "–" + str(tc) + ") — no trade")
             return 0, "NONE", " | ".join(reasons)
@@ -330,6 +348,29 @@ class SignalEngine:
             reasons.append("❌ M15: " + m15_reason + " (0 pts)")
 
         reasons.append("R1=" + str(r1) + " S1=" + str(s1))
+
+        # ── CONVICTION GATE 1: M15 HARD BLOCK ────────────────
+        # If M15 rejection failed AND price is close to TC/BC boundary (within 150p),
+        # reject the trade — this is the most common fakeout pattern
+        if not blocked:
+            near_boundary = (
+                (direction == "BUY"  and abs(price - tc) / 0.01 < 150) or
+                (direction == "SELL" and abs(price - bc) / 0.01 < 150)
+            )
+            if not m15_ok and near_boundary:
+                reasons.append("🚫 CONVICTION GATE: M15 rejection required within 150p of TC/BC — trade blocked")
+                log.info("Conviction gate blocked — no M15 confirmation near boundary")
+                return 0, "NONE", " | ".join(reasons)
+
+        # ── CONVICTION GATE 2: HIGH VOLATILITY THRESHOLD ─────
+        # When ATR > 1500p (extreme volatility), require score+1 to reduce fakeouts
+        if atr_pips is not None and atr_pips > 1500 and not blocked:
+            required = (4 if is_asian else 5) + 1
+            if score < required:
+                reasons.append("🚫 HIGH VOL GATE: ATR=" + str(atr_pips)
+                               + "p — need " + str(required) + "/7 during volatility, got " + str(score))
+                log.info("High vol gate blocked — ATR=" + str(atr_pips) + "p score=" + str(score))
+                return 0, "NONE", " | ".join(reasons)
 
         # If London/NY hard block fired, return BLOCKED so bot knows not to trade
         # but still has the full score for the Telegram message
