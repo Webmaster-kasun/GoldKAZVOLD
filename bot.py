@@ -18,9 +18,12 @@ FIX LOG:
   FIX 10 - Eliminated duplicate "Watching" alert; BLOCKED handled by main scan alert only
   FIX 11 - TP set to 2200p, SL set to 1200p (user-specified, replaces ATR-based 500-600p SL)
            Dynamic CPR target retained only when within TP range
-  FIX 12 - Replaced hard 10-min time lock with M30 Win Candle Lock:
-           After a TP win, block new entries until the M30 candle that
-           the win closed on has fully passed AND the next candle opens.
+  FIX 12 - Replaced hard 10-min time lock with M30 Win Candle Lock (superseded)
+  FIX 13 - Replaced M30 Win Candle Lock with Next-Session Win Lock:
+           After a TP win, block all new entries until the START of the
+           next trading session (Asian 09:00 / London 14:00 / NY 20:00 SGT).
+           Reason: 30 min too short for Gold — EMAs, RSI, M15 need a full
+           session reset after a 2200p move.
 """
 
 import os
@@ -66,8 +69,8 @@ ASSETS = {
     },
 }
 
-RISK_PCT_PER_TRADE = 0.01
-RISK_USD_MAX       = 15.0
+RISK_PCT_PER_TRADE = 0.014  # 1.4% of balance — targets 3 units for ~89 SGD TP
+RISK_USD_MAX       = 37.0   # SGD account: allows 3 units (3 * 1200p * 0.01 * 1.35 = ~48.6 SGD SL)
 RISK_USD_MIN       = 1.0
 
 
@@ -161,17 +164,38 @@ def sync_closed_trades(trader, today, trade_log):
             today["last_trade_close_result"] = "WIN" if float(latest.get("realizedPL", 0)) > 0 else "LOSS"
             # FIX 5: Do NOT overwrite last_trade_entry_price here
 
-            # FIX 12: Win Candle Lock — record M30 candle-close boundary of the latest win
+            # FIX 13: Next-Session Win Lock — after a TP win, block until the START of the next session
+            # Sessions (SGT): Asian 09:00, London 14:00, NY 20:00
+            # This replaces the old M30 candle lock (30 min was too short for Gold)
             if float(latest.get("realizedPL", 0)) > 0:
                 try:
                     from datetime import timezone as _tz
-                    close_raw    = latest.get("closeTime", "")
-                    close_dt     = datetime.strptime(close_raw[:16], "%Y-%m-%dT%H:%M").replace(tzinfo=_tz.utc)
-                    floor_min    = (close_dt.minute // 30) * 30
-                    candle_start = close_dt.replace(minute=floor_min, second=0, microsecond=0)
-                    candle_close = candle_start + timedelta(minutes=30)
-                    today["last_win_candle_close"] = candle_close.strftime("%Y-%m-%dT%H:%M")
-                    log.info("Win Candle Lock set: block until M30=" + today["last_win_candle_close"])
+                    import pytz as _pytz
+                    close_raw = latest.get("closeTime", "")
+                    close_dt  = datetime.strptime(close_raw[:16], "%Y-%m-%dT%H:%M").replace(tzinfo=_tz.utc)
+                    sg_tz     = _pytz.timezone("Asia/Singapore")
+                    close_sgt = close_dt.astimezone(sg_tz)
+                    h = close_sgt.hour
+
+                    # Determine next session start in SGT
+                    # Sessions: Asian=09, London=14, NY=20
+                    # After NY (>=20) or before Asian (<9): next is Asian 09:00 next day
+                    if h < 9:
+                        next_session_sgt = close_sgt.replace(hour=9, minute=0, second=0, microsecond=0)
+                    elif h < 14:
+                        next_session_sgt = close_sgt.replace(hour=14, minute=0, second=0, microsecond=0)
+                    elif h < 20:
+                        next_session_sgt = close_sgt.replace(hour=20, minute=0, second=0, microsecond=0)
+                    else:
+                        # After NY open — next is Asian tomorrow
+                        next_session_sgt = (close_sgt + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+
+                    # Convert back to UTC for storage
+                    next_session_utc = next_session_sgt.astimezone(_tz.utc)
+                    today["last_win_candle_close"] = next_session_utc.strftime("%Y-%m-%dT%H:%M")
+                    log.info("Next-Session Win Lock set: blocked until " +
+                             next_session_sgt.strftime("%H:%M SGT") + " (" +
+                             next_session_utc.strftime("%H:%M UTC") + ")")
                 except Exception as _we:
                     log.warning("Win candle lock set error: " + str(_we))
 
@@ -464,27 +488,40 @@ def run_bot():
         last_entry_price     = today.get("last_trade_entry_price") or 0
         now_utc              = datetime.utcnow()
 
-        # FIX 12: Win Candle Lock — after a TP win, block until the M30 candle
-        # that closed the win has FULLY passed AND a new candle has confirmed.
-        # No cooldown timers — uses candle boundary only.
-        last_win_candle = today.get("last_win_candle_close")  # stored as "YYYY-MM-DDTHH:MM" (M30 boundary)
+        # FIX 13: Next-Session Win Lock — block until the next session starts after a win
+        # Stored as UTC timestamp of next session open
+        last_win_candle = today.get("last_win_candle_close")
         if last_win_candle:
             try:
-                # Current M30 candle start (floor to 30-min boundary)
-                m30_floor = now_utc.replace(minute=(now_utc.minute // 30) * 30, second=0, microsecond=0)
-                win_candle_dt = datetime.strptime(last_win_candle, "%Y-%m-%dT%H:%M")
-                # Block if we are still ON or BEFORE the win-candle's next candle
-                # i.e. allow only when current M30 candle START is strictly AFTER win candle close
-                if m30_floor <= win_candle_dt:
-                    remaining_secs = int((win_candle_dt - m30_floor).total_seconds()) + 1
-                    remaining_min  = max(1, remaining_secs // 60)
+                import pytz as _pytz
+                sg_tz         = _pytz.timezone("Asia/Singapore")
+                unlock_utc    = datetime.strptime(last_win_candle, "%Y-%m-%dT%H:%M")
+                now_utc_naive = datetime.utcnow().replace(second=0, microsecond=0)
+                if now_utc_naive < unlock_utc:
+                    remaining_min = max(1, int((unlock_utc - now_utc_naive).total_seconds() // 60))
+                    unlock_sgt    = unlock_utc.replace(tzinfo=__import__("datetime").timezone.utc).astimezone(sg_tz)
                     scan_results.append(config["emoji"] + " " + name +
-                        ": 🔒 Win Candle Lock — next candle in ~" + str(remaining_min) + " min")
-                    log.info(name + " Win Candle Lock — win closed on M30=" +
-                             last_win_candle + ", current M30=" + m30_floor.strftime("%Y-%m-%dT%H:%M"))
+                        ": 🔒 Next-Session Lock — opens at " + unlock_sgt.strftime("%H:%M SGT") +
+                        " (~" + str(remaining_min) + " min)")
+                    log.info(name + " Next-Session Win Lock active — unlocks at " +
+                             unlock_sgt.strftime("%H:%M SGT"))
                     continue
             except Exception as e:
                 log.warning("Win Candle Lock error: " + str(e))
+
+        # POST-WIN QUALITY GATE
+        # After a TP win, the next trade must score higher than normal to protect profits.
+        # Reason: markets often reverse or get choppy right after a big move.
+        # Rule: if last trade was a WIN, require score >= threshold + 1 for next entry.
+        # This means: Asian needs 5/7, London/NY needs 6/7 after a win.
+        last_close_result = today.get("last_trade_close_result")
+        if last_close_result == "WIN":
+            post_win_threshold = (settings.get("signal_threshold_asian", 4) + 1 if is_asian_gold
+                                  else settings["signal_threshold"] + 1)
+            # We check score after analyze() below — store threshold for use later
+            today["_post_win_threshold"] = post_win_threshold
+        else:
+            today["_post_win_threshold"] = 0
 
         # Legacy duplicate-entry guard (non-win scenario): block same-direction re-entry
         # within the same M30 candle to prevent spam from 5-min scan loops
@@ -519,6 +556,15 @@ def run_bot():
         if not spread_ok:
             scan_results.append(config["emoji"] + " " + name +
                 ": Spread " + str(round(spread_val, 1)) + " pips | Score: " + str(score) + "/7")
+            continue
+
+        # POST-WIN QUALITY GATE ENFORCEMENT
+        # After a winning trade, require score+1 before next entry to protect profits
+        post_win_req = today.get("_post_win_threshold", 0)
+        if post_win_req > 0 and score < post_win_req and direction not in ("NONE", "BLOCKED"):
+            scan_results.append(config["emoji"] + " " + name +
+                ": 🛡️ Post-win gate — need " + str(post_win_req) + "/7 after win, got " + str(score) + "/7")
+            log.info(name + " post-win gate blocked — score=" + str(score) + " need=" + str(post_win_req))
             continue
 
         # FIX 6: Smart re-entry rules (uses already-fetched score/direction — no second API call)
@@ -688,7 +734,7 @@ def run_bot():
             log.warning(name + " order failed: " + str(result.get("error", "")))
             scan_results.append(config["emoji"] + " " + name + ": order failed — " + str(result.get("error", ""))[:50])
 
-    target_hit = realized_pnl >= 22
+    target_hit = realized_pnl >= 59  # ~80 SGD target (59 USD * 1.35)
     if target_hit:
         target_msg = "TARGET HIT! $" + str(round(pl_sgd, 0)) + " SGD today!"
     elif realized_pnl > 0:
