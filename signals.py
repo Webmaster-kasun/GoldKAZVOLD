@@ -12,14 +12,19 @@ Scoring (7 pts max):
   Check 7 — M15 Rejection   (0–1 pt):  Last M15 candle shows rejection at level
 
   Need 5/7 to trade (London/NY) | 4/7 Asian session
-  ATR filter: 300–10000p (Asian) | 500–10000p (London/NY)
-              Warning zone 5000–10000p
+  ATR filter: 300–3000p (Asian) | 500–3000p (London/NY)   ← FIX 15: was 10000p max
+              Warning zone 1500–3000p
 
   direction return values:
     "BUY"     — tradeable long signal
     "SELL"    — tradeable short signal
     "BLOCKED" — London/NY H4 hard block; full score shown for info only
     "NONE"    — no CPR breakout or bad data
+
+FIX 15: ATR extreme-volatility upper gate lowered from 10000p → 3000p.
+        Gold swings of 3000+ pips in an hour are news-driven (Iran blockade,
+        Fed surprise, etc.) — CPR breakout logic has no edge in those conditions.
+        Skipping those weeks prevents the largest losses.
 """
 
 import os
@@ -189,11 +194,16 @@ class SignalEngine:
         if atr_pips is not None:
             log.info("ATR=" + str(atr_pips) + "p")
             min_atr = 300 if is_asian else 500
+
             if atr_pips < min_atr:
                 return 0, "NONE", "ATR=" + str(atr_pips) + "p — too quiet, skip"
-            if atr_pips > 10000:
-                return 0, "NONE", "ATR=" + str(atr_pips) + "p — extreme volatility, skip"
-            if atr_pips > 5000:
+
+            # FIX 15: Upper gate lowered from 10000p → 3000p
+            # Gold moving >3000p/hour = pure news event, CPR has no edge
+            if atr_pips > 3000:
+                return 0, "NONE", "ATR=" + str(atr_pips) + "p — news-driven extreme volatility, skip week"
+
+            if atr_pips > 1500:
                 reasons.append("⚠️ ATR=" + str(atr_pips) + "p — elevated (warning, proceed with caution)")
             else:
                 reasons.append("✅ ATR=" + str(atr_pips) + "p — healthy volatility")
@@ -221,8 +231,6 @@ class SignalEngine:
         r1 = cpr["r1"];  s1 = cpr["s1"]
         log.info("CPR TC=" + str(tc) + " BC=" + str(bc) + " price=" + str(price))
 
-        # Require minimum buffer beyond TC/BC to avoid fakeout entries at the boundary
-        # Asian: 30p buffer | London/NY: 60p buffer
         BREAKOUT_BUFFER = 30 if is_asian else 60
         buffer_val = BREAKOUT_BUFFER * 0.01
 
@@ -252,8 +260,6 @@ class SignalEngine:
             return 0, "NONE", " | ".join(reasons)
 
         # ── CHECK 2: H4 TREND ────────────────────────────────
-        # Asian:     -1 pt penalty (soft, trade can still fire if score passes)
-        # London/NY: hard block (direction → BLOCKED, all checks still run for info)
         h4_against = (h4_direction != "NONE" and direction != h4_direction)
         if h4_against:
             if is_asian:
@@ -269,7 +275,7 @@ class SignalEngine:
                 reasons.append("✅ H4 trend=" + h4_direction + " confirms direction")
 
         # ── CHECK 3: EMA ALIGNMENT (0–1 pt) ──────────────────
-        ema20 = price  # fallback if not enough data
+        ema20 = price  # fallback
         if len(h1_closes) >= 50:
             ema20 = self._ema(h1_closes, 20)[-1]
             ema50 = self._ema(h1_closes, 50)[-1]
@@ -350,8 +356,6 @@ class SignalEngine:
         reasons.append("R1=" + str(r1) + " S1=" + str(s1))
 
         # ── CONVICTION GATE 1: M15 HARD BLOCK ────────────────
-        # If M15 rejection failed AND price is close to TC/BC boundary (within 150p),
-        # reject the trade — this is the most common fakeout pattern
         if not blocked:
             near_boundary = (
                 (direction == "BUY"  and abs(price - tc) / 0.01 < 150) or
@@ -363,17 +367,15 @@ class SignalEngine:
                 return 0, "NONE", " | ".join(reasons)
 
         # ── CONVICTION GATE 2: HIGH VOLATILITY THRESHOLD ─────
-        # When ATR > 1500p (extreme volatility), require score+1 to reduce fakeouts
+        # FIX 15: Gate now only fires between 1500–3000p (above 3000 is already skipped by ATR filter)
         if atr_pips is not None and atr_pips > 1500 and not blocked:
             required = (4 if is_asian else 5) + 1
             if score < required:
                 reasons.append("🚫 HIGH VOL GATE: ATR=" + str(atr_pips)
-                               + "p — need " + str(required) + "/7 during volatility, got " + str(score))
+                               + "p — need " + str(required) + "/7 during elevated volatility, got " + str(score))
                 log.info("High vol gate blocked — ATR=" + str(atr_pips) + "p score=" + str(score))
                 return 0, "NONE", " | ".join(reasons)
 
-        # If London/NY hard block fired, return BLOCKED so bot knows not to trade
-        # but still has the full score for the Telegram message
         final_direction = "BLOCKED" if blocked else direction
 
         log.info("Score=" + str(score) + "/7 direction=" + final_direction)

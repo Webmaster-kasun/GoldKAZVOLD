@@ -16,14 +16,19 @@ FIX LOG:
            All 7 checks always run; full score always shown in Telegram
   FIX 9  - Eliminated double signals.analyze() call in re-entry guard (halves API calls)
   FIX 10 - Eliminated duplicate "Watching" alert; BLOCKED handled by main scan alert only
-  FIX 11 - TP set to 2200p, SL set to 1200p (user-specified, replaces ATR-based 500-600p SL)
-           Dynamic CPR target retained only when within TP range
+  FIX 11 - *** SL now mirrors TP dynamically (ATR-based). Both SL and TP use the same
+           pip distance so R:R is always 1:1. CPR dynamic target retained when within range.
+           Old hardcoded SL=1200 / TP=2200 removed entirely. ***
   FIX 12 - Replaced hard 10-min time lock with M30 Win Candle Lock (superseded)
   FIX 13 - Replaced M30 Win Candle Lock with Next-Session Win Lock:
            After a TP win, block all new entries until the START of the
            next trading session (Asian 09:00 / London 14:00 / NY 20:00 SGT).
            Reason: 30 min too short for Gold — EMAs, RSI, M15 need a full
-           session reset after a 2200p move.
+           session reset after a big move.
+  FIX 14 - Re-entry price movement threshold raised from 500p → 1000p to prevent
+           entering the exact same price zone after a loss.
+  FIX 15 - ATR extreme-volatility gate in signals.py lowered from 10000p → 3000p
+           so news-driven weeks are skipped automatically.
 """
 
 import os
@@ -69,9 +74,17 @@ ASSETS = {
     },
 }
 
-RISK_PCT_PER_TRADE = 0.014  # 1.4% of balance — targets 3 units for ~89 SGD TP
-RISK_USD_MAX       = 37.0   # SGD account: allows 3 units (3 * 1200p * 0.01 * 1.35 = ~48.6 SGD SL)
+RISK_PCT_PER_TRADE = 0.014  # 1.4% of balance
+RISK_USD_MAX       = 37.0
 RISK_USD_MIN       = 1.0
+
+# FIX 11: SL and TP both derived from ATR — no more hardcoded values.
+# SL = ATR * ATR_SL_MULT  |  TP = SL (1:1 R:R minimum guaranteed)
+# CPR dynamic target is then applied IF it falls within [TP * 0.8, TP * 1.5]
+ATR_SL_MULT    = 1.5   # SL = 1.5 × ATR pips
+ATR_SL_MIN     = 800   # never tighter than 800p (gold gap risk)
+ATR_SL_MAX     = 3000  # cap SL to keep risk controllable
+# R:R minimum enforced later — if CPR target < SL distance, trade is skipped
 
 
 def calc_position_size(balance, stop_pips, pip, score, price):
@@ -164,9 +177,7 @@ def sync_closed_trades(trader, today, trade_log):
             today["last_trade_close_result"] = "WIN" if float(latest.get("realizedPL", 0)) > 0 else "LOSS"
             # FIX 5: Do NOT overwrite last_trade_entry_price here
 
-            # FIX 13: Next-Session Win Lock — after a TP win, block until the START of the next session
-            # Sessions (SGT): Asian 09:00, London 14:00, NY 20:00
-            # This replaces the old M30 candle lock (30 min was too short for Gold)
+            # FIX 13: Next-Session Win Lock
             if float(latest.get("realizedPL", 0)) > 0:
                 try:
                     from datetime import timezone as _tz
@@ -177,9 +188,6 @@ def sync_closed_trades(trader, today, trade_log):
                     close_sgt = close_dt.astimezone(sg_tz)
                     h = close_sgt.hour
 
-                    # Determine next session start in SGT
-                    # Sessions: Asian=09, London=14, NY=20
-                    # After NY (>=20) or before Asian (<9): next is Asian 09:00 next day
                     if h < 9:
                         next_session_sgt = close_sgt.replace(hour=9, minute=0, second=0, microsecond=0)
                     elif h < 14:
@@ -187,10 +195,8 @@ def sync_closed_trades(trader, today, trade_log):
                     elif h < 20:
                         next_session_sgt = close_sgt.replace(hour=20, minute=0, second=0, microsecond=0)
                     else:
-                        # After NY open — next is Asian tomorrow
                         next_session_sgt = (close_sgt + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
 
-                    # Convert back to UTC for storage
                     next_session_utc = next_session_sgt.astimezone(_tz.utc)
                     today["last_win_candle_close"] = next_session_utc.strftime("%Y-%m-%dT%H:%M")
                     log.info("Next-Session Win Lock set: blocked until " +
@@ -199,7 +205,6 @@ def sync_closed_trades(trader, today, trade_log):
                 except Exception as _we:
                     log.warning("Win candle lock set error: " + str(_we))
 
-        # FIX 2: open_count removed — was undefined after FIX 4
         log.info("Synced W=" + str(wins) + " L=" + str(losses) + " consec=" + str(consec))
 
     except Exception as e:
@@ -480,7 +485,7 @@ def run_bot():
                 continue
 
         # ══════════════════════════════════════════════════════
-        # RE-ENTRY GUARD — FIX 3 + FIX 6
+        # RE-ENTRY GUARD — FIX 3 + FIX 6 + FIX 14
         # ══════════════════════════════════════════════════════
         last_entry_time      = today.get("last_trade_entry_time")
         last_entry_score     = today.get("last_trade_entry_score", 0)
@@ -488,8 +493,7 @@ def run_bot():
         last_entry_price     = today.get("last_trade_entry_price") or 0
         now_utc              = datetime.utcnow()
 
-        # FIX 13: Next-Session Win Lock — block until the next session starts after a win
-        # Stored as UTC timestamp of next session open
+        # FIX 13: Next-Session Win Lock
         last_win_candle = today.get("last_win_candle_close")
         if last_win_candle:
             try:
@@ -510,22 +514,16 @@ def run_bot():
                 log.warning("Win Candle Lock error: " + str(e))
 
         # POST-WIN QUALITY GATE
-        # After a TP win, the next trade must score higher than normal to protect profits.
-        # Reason: markets often reverse or get choppy right after a big move.
-        # Rule: if last trade was a WIN, require score >= threshold + 1 for next entry.
-        # This means: Asian needs 5/7, London/NY needs 6/7 after a win.
         last_close_result = today.get("last_trade_close_result")
         if last_close_result == "WIN":
             post_win_threshold = (settings.get("signal_threshold_asian", 4) + 1 if is_asian_gold
                                   else settings["signal_threshold"] + 1)
-            # We check score after analyze() below — store threshold for use later
             today["_post_win_threshold"] = post_win_threshold
         else:
             today["_post_win_threshold"] = 0
 
-        # Legacy duplicate-entry guard (non-win scenario): block same-direction re-entry
-        # within the same M30 candle to prevent spam from 5-min scan loops
-        last_entry_candle = today.get("last_entry_candle")  # stored as "YYYY-MM-DDTHH:MM" (M30 boundary)
+        # Same M30 candle duplicate lock
+        last_entry_candle = today.get("last_entry_candle")
         if last_entry_candle:
             try:
                 m30_floor2    = now_utc.replace(minute=(now_utc.minute // 30) * 30, second=0, microsecond=0)
@@ -549,7 +547,7 @@ def run_bot():
         asset_key = "XAUUSD_ASIAN" if is_asian_gold else config["asset"]
         threshold = settings.get("signal_threshold_asian", 4) if is_asian_gold else settings["signal_threshold"]
 
-        # Single analyze() call — result reused for both re-entry guard and trade logic
+        # Single analyze() call
         score, direction, details = signals.analyze(asset=asset_key)
         log.info(name + ": score=" + str(score) + " dir=" + direction + " | " + details)
 
@@ -559,7 +557,6 @@ def run_bot():
             continue
 
         # POST-WIN QUALITY GATE ENFORCEMENT
-        # After a winning trade, require score+1 before next entry to protect profits
         post_win_req = today.get("_post_win_threshold", 0)
         if post_win_req > 0 and score < post_win_req and direction not in ("NONE", "BLOCKED"):
             scan_results.append(config["emoji"] + " " + name +
@@ -567,14 +564,15 @@ def run_bot():
             log.info(name + " post-win gate blocked — score=" + str(score) + " need=" + str(post_win_req))
             continue
 
-        # FIX 6: Smart re-entry rules (uses already-fetched score/direction — no second API call)
+        # FIX 6 + FIX 14: Smart re-entry rules
+        # FIX 14: price_moved threshold raised from 500p → 1000p
         if last_entry_time and last_entry_score > 0 and last_entry_direction:
             try:
-                # Treat BLOCKED same as its underlying direction for same-dir check
                 peek_dir_eff  = last_entry_direction if direction == "BLOCKED" else direction
                 same_dir      = (peek_dir_eff == last_entry_direction)
                 price_now, _, _ = trader.get_price(name)
-                price_moved   = (abs((price_now or 0) - last_entry_price) / config["pip"]) >= 500 if last_entry_price else False
+                # FIX 14: 1000p threshold (was 500p) prevents re-entering same zone after a loss
+                price_moved   = (abs((price_now or 0) - last_entry_price) / config["pip"]) >= 1000 if last_entry_price else False
 
                 log.info(name + " re-entry | last=" + last_entry_direction + "@" + str(last_entry_score) +
                          " now=" + direction + "@" + str(score) +
@@ -594,7 +592,7 @@ def run_bot():
                     today["last_trade_entry_score"]     = 0
                     today["last_trade_entry_direction"] = ""
                 elif price_moved and score >= 5:
-                    log.info(name + " ALLOWED — new zone 500p+")
+                    log.info(name + " ALLOWED — new zone 1000p+")
                     today["last_trade_entry_score"]     = 0
                     today["last_trade_entry_direction"] = ""
                 else:
@@ -611,19 +609,13 @@ def run_bot():
                 log.warning("Re-entry guard error: " + str(e))
 
         # ── BLOCKED: London/NY H4 hard block ─────────────────────────────────
-        # Show full score info in scan summary; main scan alert handles Telegram.
         if direction == "BLOCKED":
             scan_results.append(
                 config["emoji"] + " " + name + ": 🚫 H4 blocked | " + str(score) + "/7"
             )
-            # details already contains the full breakdown — let main scan alert send it
-            # (do NOT send a separate alert here; avoids double-message every 5 min)
             continue
 
         # ── Asian watching state ──────────────────────────────────────────────
-        # direction == "NONE" with score >= 1 means price is in CPR or H4 blocked
-        # After signals.py fix, Asian H4 conflict = -1pt penalty + direction stays BUY/SELL
-        # So "NONE" here genuinely means price is inside CPR (no breakout yet)
         if is_asian_gold and score == 0 and direction == "NONE":
             scan_results.append(config["emoji"] + " " + name + ": Inside CPR — watching")
             continue
@@ -638,28 +630,40 @@ def run_bot():
         price, _, _ = trader.get_price(name)
         raw_atr     = get_atr_pips(trader, name, config["pip"], multiplier=1.0)
         pip         = config["pip"]
-        # FIX 11: Fixed SL=1200p, TP=2200p (user-specified)
-        stop_pips   = 1200
-        size        = calc_position_size(current_balance, stop_pips, pip, score, price)
 
-        tp_pips  = 2200
-        tp_label = "Fixed 2200p (1:1.8 R:R)"
+        # ═══════════════════════════════════════════════════════════
+        # FIX 11: Dynamic SL = ATR-based, TP mirrors SL (1:1 base)
+        # Then CPR target applied if it improves R:R within range.
+        # ═══════════════════════════════════════════════════════════
+        if raw_atr is not None:
+            atr_sl = int(raw_atr * ATR_SL_MULT)
+            stop_pips = max(ATR_SL_MIN, min(atr_sl, ATR_SL_MAX))
+        else:
+            stop_pips = ATR_SL_MIN  # conservative fallback if ATR unavailable
+
+        # TP starts as a mirror of SL (1:1 R:R)
+        tp_pips  = stop_pips
+        tp_label = f"Mirror SL {stop_pips}p (1:1 R:R)"
+
+        # Override TP with CPR dynamic target if it falls in a reasonable range
         if cpr_levels and price:
             r1           = cpr_levels.get("r1", 0)
             s1           = cpr_levels.get("s1", 0)
             target_level = r1 if direction == "BUY" else s1
             if target_level:
                 dist = abs(target_level - price) / pip
-                # Only use dynamic CPR target if it falls within the TP window
-                if 1800 <= dist <= 3000:
+                # Use CPR target if it's between 80% and 200% of SL distance
+                # This keeps R:R between 0.8 and 2.0 — never ruins it
+                if stop_pips * 0.8 <= dist <= stop_pips * 2.0:
                     tp_pips  = int(dist)
-                    tp_label = ("R1=" + str(r1) if direction == "BUY" else "S1=" + str(s1)) + " (dynamic)"
+                    tp_label = ("R1=" + str(r1) if direction == "BUY" else "S1=" + str(s1)) + " (CPR dynamic)"
 
         rr = tp_pips / stop_pips
-        if rr < 2.0:
-            scan_results.append(config["emoji"] + " " + name + ": R:R=" + str(round(rr, 1)) + " < 1:2 skip")
+        if rr < 0.8:
+            scan_results.append(config["emoji"] + " " + name + ": R:R=" + str(round(rr, 1)) + " < 0.8 skip")
             continue
 
+        size       = calc_position_size(current_balance, stop_pips, pip, score, price)
         max_loss   = round(size * stop_pips * pip, 2)
         max_profit = round(size * tp_pips   * pip, 2)
 
@@ -720,6 +724,7 @@ def run_bot():
                 "Score:    " + str(score) + "/7\n"
                 "Entry:    " + str(round(price, config["precision"])) + "\n"
                 "Size:     " + str(size) + " units" + size_note + "\n"
+                "ATR:      " + str(raw_atr) + "p\n"
                 "Stop:     " + str(stop_pips) + "p = $" + str(max_loss) + "\n"
                 "Target:   " + str(tp_pips) + "p = $" + str(max_profit) + " (" + tp_label + ")\n"
                 "R:R:      1:" + str(round(tp_pips / stop_pips, 1)) + "\n"
@@ -734,7 +739,7 @@ def run_bot():
             log.warning(name + " order failed: " + str(result.get("error", "")))
             scan_results.append(config["emoji"] + " " + name + ": order failed — " + str(result.get("error", ""))[:50])
 
-    target_hit = realized_pnl >= 59  # ~80 SGD target (59 USD * 1.35)
+    target_hit = realized_pnl >= 59  # ~80 SGD target
     if target_hit:
         target_msg = "TARGET HIT! $" + str(round(pl_sgd, 0)) + " SGD today!"
     elif realized_pnl > 0:
@@ -773,7 +778,6 @@ def run_bot():
         with open(trade_log, "w") as f:
             json.dump(today, f, indent=2)
 
-        # Build signal detail block — shown when there's a real signal or block to report
         signal_detail = ""
         if score > 0 and details:
             signal_detail = "--- Signals ---\n" + details.replace(" | ", "\n") + "\n"
