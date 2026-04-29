@@ -157,6 +157,11 @@ def sync_closed_trades(trader, today, trade_log):
         today["losses"] = losses
         # FIX 4: Never overwrite today["trades"] — local counter is source of truth
 
+        # Bug #6 Fix: accumulate realized PL from actual closed trade objects (not balance delta)
+        trade_pl_sum = sum(float(t.get("realizedPL", 0)) for t in trades
+                          if t.get("closeTime", "") >= day_start_utc)
+        today["realized_pl_trades"] = round(trade_pl_sum, 4)
+
         consec = 0
         for t in sorted(trades, key=lambda x: x.get("closeTime", ""), reverse=True):
             if t.get("closeTime", "") < day_start_utc:
@@ -183,6 +188,7 @@ def sync_closed_trades(trader, today, trade_log):
                     from datetime import timezone as _tz
                     import pytz as _pytz
                     close_raw = latest.get("closeTime", "")
+                    # Bug #3 Fix: attach UTC tz explicitly before converting — prevents silent naive-dt bug
                     close_dt  = datetime.strptime(close_raw[:16], "%Y-%m-%dT%H:%M").replace(tzinfo=_tz.utc)
                     sg_tz     = _pytz.timezone("Asia/Singapore")
                     close_sgt = close_dt.astimezone(sg_tz)
@@ -255,7 +261,8 @@ def send_daily_summary(alert, today, cpr_gold, mode):
         losses       = today.get("losses", 0)
         total        = wins + losses
         win_rate     = round((wins / total * 100)) if total > 0 else 0
-        realized     = today.get("daily_pnl", 0.0)
+        # Bug #6 Fix: use sum of closed trade PL (not balance delta which includes financing noise)
+        realized     = today.get("realized_pl_trades", today.get("daily_pnl", 0.0))
         realized_sgd = round(realized * 1.35, 2)
         pnl_emoji    = "UP" if realized >= 0 else "DOWN"
         wr_emoji     = "GREEN" if win_rate >= 60 else ("YELLOW" if win_rate >= 40 else "RED")
@@ -441,14 +448,19 @@ def run_bot():
 
     signals      = SignalEngine(demo=settings["demo_mode"])
     scan_results = []
-    score        = -1
-    direction    = ""
+    # Bug #8 Fix: initialize to safe defaults — used in scan alert after loop,
+    # even if loop exits early (position open, off-session, cap hit, etc.)
+    score     = 0
+    direction = ""
+    details   = "No scan run this cycle"
 
     for name, config in ASSETS.items():
         if not settings.get(config["setting"], True):
             continue
         if today["trades"] >= settings["max_trades_day"]:
             break
+
+        cpr_levels = None  # Bug #7 Fix: always defined; set before any early-continue path
 
         position = trader.get_position(name)
         if position:
@@ -499,11 +511,12 @@ def run_bot():
             try:
                 import pytz as _pytz
                 sg_tz         = _pytz.timezone("Asia/Singapore")
-                unlock_utc    = datetime.strptime(last_win_candle, "%Y-%m-%dT%H:%M")
-                now_utc_naive = datetime.utcnow().replace(second=0, microsecond=0)
-                if now_utc_naive < unlock_utc:
-                    remaining_min = max(1, int((unlock_utc - now_utc_naive).total_seconds() // 60))
-                    unlock_sgt    = unlock_utc.replace(tzinfo=__import__("datetime").timezone.utc).astimezone(sg_tz)
+                unlock_utc    = datetime.strptime(last_win_candle, "%Y-%m-%dT%H:%M").replace(
+                    tzinfo=__import__("datetime").timezone.utc)  # Bug #3 Fix: always tz-aware
+                now_utc_aware = datetime.now(__import__("datetime").timezone.utc).replace(second=0, microsecond=0)
+                if now_utc_aware < unlock_utc:
+                    remaining_min = max(1, int((unlock_utc - now_utc_aware).total_seconds() // 60))
+                    unlock_sgt    = unlock_utc.astimezone(sg_tz)
                     scan_results.append(config["emoji"] + " " + name +
                         ": 🔒 Next-Session Lock — opens at " + unlock_sgt.strftime("%H:%M SGT") +
                         " (~" + str(remaining_min) + " min)")
@@ -667,6 +680,15 @@ def run_bot():
         max_loss   = round(size * stop_pips * pip, 2)
         max_profit = round(size * tp_pips   * pip, 2)
 
+        # Bug #4 Fix: alert when size > 1 so elevated risk is visible
+        if size > 1:
+            alert.send(
+                "⚠️ ELEVATED SIZE: " + str(size) + " units\n"
+                "Max loss this trade: $" + str(max_loss) + "\n"
+                "Balance: $" + str(round(current_balance, 2)) + "\n"
+                "Reason: short SL (" + str(stop_pips) + "p) + risk formula"
+            )
+
         try:
             mr = requests.get(trader.base_url + "/v3/accounts/" + trader.account_id,
                               headers=trader.headers, timeout=10)
@@ -694,7 +716,8 @@ def run_bot():
             now_utc_entry = datetime.utcnow()
             m30_entry     = now_utc_entry.replace(minute=(now_utc_entry.minute // 30) * 30, second=0, microsecond=0)
             today["trades"]                    += 1
-            today["consec_losses"]              = 0
+            # Bug #5 Fix: do NOT reset consec_losses here — sync_closed_trades() is the source of truth.
+            # Resetting at entry under-counts streaks (trade might still lose).
             today["breakeven_" + name]          = False
             today["last_trade_entry_price"]     = price
             today["last_trade_entry_time"]      = now_utc_entry.strftime("%Y-%m-%dT%H:%M:%S")

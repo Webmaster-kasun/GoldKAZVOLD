@@ -23,8 +23,12 @@ FIX: Accepts demo=True/False to use correct OANDA endpoint.
 import logging
 import requests
 import os
+from datetime import datetime
+import pytz
 
 log = logging.getLogger(__name__)
+
+_SG_TZ = pytz.timezone("Asia/Singapore")
 
 
 class CPRCalculator:
@@ -63,9 +67,12 @@ class CPRCalculator:
         Returns dict with all levels + width classification.
         Cached after first call.
         """
-        if instrument in self._cache:
-            log.info("CPR " + instrument + " (cached): " + str(self._cache[instrument]))
-            return self._cache[instrument]
+        # Bug #1 Fix: expire cache when the calendar date changes (new trading day = new CPR)
+        today_str = datetime.now(_SG_TZ).strftime("%Y-%m-%d")
+        cached = self._cache.get(instrument)
+        if cached and cached.get("_cache_date") == today_str:
+            log.info("CPR " + instrument + " (cached today): " + str(cached))
+            return cached
 
         candle = self._fetch_yesterday_candle(instrument)
         if not candle:
@@ -109,7 +116,8 @@ class CPRCalculator:
             "width_label": width_label,
             "is_narrow":   width_pct < 0.3,
             "is_wide":     width_pct > 0.6,
-            "date":        candle["time"]
+            "date":        candle["time"],
+            "_cache_date": datetime.now(_SG_TZ).strftime("%Y-%m-%d"),  # Bug #1 Fix
         }
 
         self._cache[instrument] = levels

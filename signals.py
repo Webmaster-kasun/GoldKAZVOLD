@@ -116,6 +116,26 @@ class SignalEngine:
             trs.append(tr)
         return round(sum(trs[-period:]) / period / 0.01)
 
+    def _get_d1_trend(self):
+        """
+        Bug #2 Fix: D1 EMA20 vs EMA50 macro trend filter.
+        Returns 'BUY', 'SELL', or 'NONE'.
+        Prevents counter-trend entries during strong daily trends.
+        """
+        try:
+            closes, _, _, _, _ = self._fetch_candles("XAU_USD", "D", 60)
+            if len(closes) < 50:
+                log.warning("D1 trend: insufficient data")
+                return "NONE"
+            ema20 = self._ema(closes, 20)[-1]
+            ema50 = self._ema(closes, 50)[-1]
+            trend = "BUY" if ema20 > ema50 else "SELL"
+            log.info("D1 trend=" + trend + " EMA20=" + str(round(ema20, 2)) + " EMA50=" + str(round(ema50, 2)))
+            return trend
+        except Exception as e:
+            log.warning("D1 trend error: " + str(e))
+            return "NONE"
+
     def _get_prior_day_levels(self):
         """Get yesterday's High and Low from D1 candles"""
         try:
@@ -183,6 +203,9 @@ class SignalEngine:
 
         if not h1_closes:
             return 0, "NONE", "No price data"
+
+        # Bug #2 Fix: fetch D1 macro trend once per analyze call
+        d1_trend = self._get_d1_trend()
 
         price = self._get_live_price("XAU_USD")
         if price is None:
@@ -273,6 +296,22 @@ class SignalEngine:
         else:
             if h4_direction != "NONE":
                 reasons.append("✅ H4 trend=" + h4_direction + " confirms direction")
+
+        # ── Bug #2 Fix: D1 MACRO TREND FILTER ────────────────
+        # If D1 trend opposes trade direction, require +2 score threshold.
+        # This prevents counter-trend entries during strong daily trends.
+        d1_against = (d1_trend != "NONE" and direction != d1_trend)
+        if d1_against and not blocked:
+            reasons.append("⚠️ D1 trend=" + d1_trend + " opposes " + direction
+                           + " — raising threshold by 2 (counter-trend caution)")
+            # Store penalty for threshold enforcement at the scoring gate below
+            _d1_penalty = 2
+        elif d1_trend != "NONE":
+            reasons.append("✅ D1 trend=" + d1_trend + " aligns with " + direction)
+            _d1_penalty = 0
+        else:
+            reasons.append("⚠️ D1 trend: insufficient data — no D1 filter applied")
+            _d1_penalty = 0
 
         # ── CHECK 3: EMA ALIGNMENT (0–1 pt) ──────────────────
         ema20 = price  # fallback
@@ -374,6 +413,15 @@ class SignalEngine:
                 reasons.append("🚫 HIGH VOL GATE: ATR=" + str(atr_pips)
                                + "p — need " + str(required) + "/7 during elevated volatility, got " + str(score))
                 log.info("High vol gate blocked — ATR=" + str(atr_pips) + "p score=" + str(score))
+                return 0, "NONE", " | ".join(reasons)
+
+        # ── Bug #2 Fix: D1 COUNTER-TREND GATE ────────────────
+        if _d1_penalty > 0 and not blocked:
+            base_threshold = 4 if is_asian else 5
+            required = base_threshold + _d1_penalty
+            if score < required:
+                reasons.append("🚫 D1 COUNTER-TREND GATE: need " + str(required) + "/7 against D1 trend, got " + str(score))
+                log.info("D1 counter-trend gate blocked — score=" + str(score) + " need=" + str(required))
                 return 0, "NONE", " | ".join(reasons)
 
         final_direction = "BLOCKED" if blocked else direction
