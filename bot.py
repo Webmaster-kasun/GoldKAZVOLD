@@ -335,12 +335,27 @@ def run_bot():
 
     trader = OandaTrader(demo=settings["demo_mode"])
     if not trader.login():
-        alert.send(
-            "❌ OANDA Login Failed\n"
-            "Check OANDA_API_KEY and OANDA_ACCOUNT_ID\n"
-            "demo_mode=true  -> practice account\n"
-            "demo_mode=false -> live account"
-        )
+        # SPAM FIX 2: Login-fail alert throttled to once per hour.
+        # Without this, a 1-hour OANDA outage sends 12 identical messages.
+        login_fail_log = "login_fail_alert.json"
+        try:
+            with open(login_fail_log) as _f:
+                _lf = json.load(_f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            _lf = {"last_alert_min": -61}
+        _cur_min = now.hour * 60 + now.minute
+        _mins_since = _cur_min - _lf["last_alert_min"] if _cur_min >= _lf["last_alert_min"] else _cur_min + 1440 - _lf["last_alert_min"]
+        if _mins_since >= 60:
+            alert.send(
+                "❌ OANDA Login Failed\n"
+                "Check OANDA_API_KEY and OANDA_ACCOUNT_ID\n"
+                "demo_mode=true  -> practice account\n"
+                "demo_mode=false -> live account"
+            )
+            with open(login_fail_log, "w") as _f:
+                json.dump({"last_alert_min": _cur_min}, _f)
+        else:
+            log.warning("Login failed (alert suppressed — sent " + str(_mins_since) + " min ago)")
         return
 
     current_balance = trader.last_balance
@@ -679,15 +694,9 @@ def run_bot():
         size       = calc_position_size(current_balance, stop_pips, pip, score, price)
         max_loss   = round(size * stop_pips * pip, 2)
         max_profit = round(size * tp_pips   * pip, 2)
-
-        # Bug #4 Fix: alert when size > 1 so elevated risk is visible
-        if size > 1:
-            alert.send(
-                "⚠️ ELEVATED SIZE: " + str(size) + " units\n"
-                "Max loss this trade: $" + str(max_loss) + "\n"
-                "Balance: $" + str(round(current_balance, 2)) + "\n"
-                "Reason: short SL (" + str(stop_pips) + "p) + risk formula"
-            )
+        # SPAM FIX 3: Removed pre-order elevated-size alert here.
+        # Previously fired before order placement — meaning a failed order still sent the alert.
+        # Size warning is now folded into the trade confirmation message below (only on success).
 
         try:
             mr = requests.get(trader.base_url + "/v3/accounts/" + trader.account_id,
@@ -740,13 +749,14 @@ def run_bot():
             ) if cpr_levels else "CPR: unavailable"
 
             size_note = " (wide CPR)" if is_wide else ""
+            size_warn = ("\n⚠️ SIZE=" + str(size) + " units — max loss $" + str(max_loss)) if size > 1 else ""
             alert.send(
                 "🥇 GOLD TRADE! " + mode + "\n"
                 + config["emoji"] + " " + name + "\n"
                 "Direction: " + direction + "\n"
                 "Score:    " + str(score) + "/7\n"
                 "Entry:    " + str(round(price, config["precision"])) + "\n"
-                "Size:     " + str(size) + " units" + size_note + "\n"
+                "Size:     " + str(size) + " units" + size_note + size_warn + "\n"
                 "ATR:      " + str(raw_atr) + "p\n"
                 "Stop:     " + str(stop_pips) + "p = $" + str(max_loss) + "\n"
                 "Target:   " + str(tp_pips) + "p = $" + str(max_profit) + " (" + tp_label + ")\n"
@@ -791,8 +801,21 @@ def run_bot():
     last_alert_dir    = today.get("last_alert_direction", "")
     current_min       = now.hour * 60 + now.minute
     mins_since_alert  = current_min - last_alert_min if current_min >= last_alert_min else current_min + 1440 - last_alert_min
-    score_changed     = (score != last_alert_score or direction != last_alert_dir)
-    should_alert      = trade_just_placed or score_changed or mins_since_alert >= 60
+
+    # SPAM FIX 1: Suppress scan alerts for minor score noise.
+    # Alert only when something *meaningful* changed:
+    #   (a) direction flipped (NONE<->BUY/SELL or BUY<->SELL) — always actionable
+    #   (b) score crossed the trade threshold in either direction — about to trade / just dropped out
+    #   (c) score moved >=2 pts AND is at/above threshold — meaningful signal progress
+    # Pure ±1 pt wobble below threshold (e.g. 2->3->2) is noise — suppressed.
+    dir_changed    = (direction != last_alert_dir)
+    crossed_thresh = (
+        (score >= threshold_used and last_alert_score < threshold_used) or
+        (score < threshold_used  and last_alert_score >= threshold_used)
+    )
+    big_score_move = (abs(score - last_alert_score) >= 2 and score >= threshold_used)
+    score_changed  = dir_changed or crossed_thresh or big_score_move
+    should_alert   = trade_just_placed or score_changed or mins_since_alert >= 60
 
     if should_alert:
         today["last_scan_alert_min"]  = current_min
@@ -802,8 +825,13 @@ def run_bot():
             json.dump(today, f, indent=2)
 
         signal_detail = ""
-        if score > 0 and details:
+        # SPAM FIX 5: Only include full signal detail when score is actionable.
+        # Hourly heartbeat scans with no setup are kept short — no CPR block, no signal breakdown.
+        at_threshold = (score >= threshold_used and direction not in ("NONE", "BLOCKED"))
+        if at_threshold and details:
             signal_detail = "--- Signals ---\n" + details.replace(" | ", "\n") + "\n"
+
+        include_cpr = cpr_line if (at_threshold or trade_just_placed) else ""
 
         alert.send(
             "🥇 GOLD BOT Scan! " + mode + "\n"
@@ -815,7 +843,7 @@ def run_bot():
             "Need: " + str(threshold_used) + "/7 to trade\n"
             + target_msg + "\n"
             "-------------------------\n"
-            + cpr_line +
+            + include_cpr +
             "--- Setups ---\n"
             + summary + "\n"
             + signal_detail
