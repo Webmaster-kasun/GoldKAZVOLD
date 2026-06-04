@@ -140,6 +140,9 @@ def validate_settings(settings: dict) -> dict:
     # v4.4 — Three sessions active
     settings.setdefault("spread_limits",             {"Asian": 150, "London": 140, "US": 140})
     settings.setdefault("max_trades_day",            999)   # v4.0-uncapped
+    settings.setdefault("max_overall_loss_streak",   3)     # v6.0 — block after N consecutive SLs any direction
+    settings.setdefault("overall_loss_streak_cooldown_min", 240)  # v6.0 — 4h cooldown after streak
+    settings.setdefault("max_daily_drawdown_pct",    3.0)   # v6.0 — stop if account drops 3% from day open
     settings.setdefault("max_wins_day",              1)     # v5.4 — stop after 1 win/day; matches settings.json default
     settings.setdefault("max_losing_trades_day",     3)     # v5.4 — safe hard stop; was 999 (uncapped) — dangerous fallback
     settings.setdefault("sl_mode",                   "atr_based")   # v4.0
@@ -1086,6 +1089,11 @@ def _pyramid_phase(db, run_id, settings, alert, trader, history, now_sgt, today,
     pyramid_sl_usd  = float(settings.get("pyramid_sl_usd", 1.50))
     pyramid_max_risk = float(settings.get("pyramid_max_risk_usd", 50))
 
+    # v6.0: apply same currency-rate correction to pyramid risk
+    _pyr_rate = float(ctx.get("account_summary", {}).get("currency_rate", 1.0) or 1.0)
+    if _pyr_rate > 1.01:
+        pyramid_max_risk = round(pyramid_max_risk / _pyr_rate, 2)
+
     # Units from tight SL
     pyramid_units = calculate_units_from_position(pyramid_max_risk, pyramid_sl_usd)
 
@@ -1329,6 +1337,20 @@ def _guard_phase(db, run_id, settings, alert, trader, history, now_sgt, today, d
         update_runtime_state(last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"), status="FAILED_LOGIN")
         return None
 
+    # v6.0: Fetch live account-currency conversion rate (e.g. USD→SGD ≈ 1.28).
+    # XAU/USD profit is in USD; OANDA then multiplies by this rate to arrive at
+    # the account-currency value. Without correction the bot targets $100 SGD risk
+    # but actually risks $128 SGD — a systematic 28% overcharge on every loss.
+    # From live data: every SL cost ~$72 SGD when the bot calculated ~$56 USD.
+    _currency_rate = trader.get_account_currency_rate(INSTRUMENT)
+    account_summary["currency_rate"] = _currency_rate
+    if abs(_currency_rate - 1.0) > 0.01:
+        log.info(
+            "Account currency rate: %.4f — position sizes will be scaled to %.0f USD to target $100 account-currency risk",
+            _currency_rate, 100 / _currency_rate,
+            extra={"run_id": run_id},
+        )
+
     reconcile = reconcile_runtime_state(trader, history, INSTRUMENT, now_sgt, alert=alert)
     if reconcile.get("recovered_trade_ids") or reconcile.get("backfilled_trade_ids"):
         save_history(history)
@@ -1359,6 +1381,69 @@ def _guard_phase(db, run_id, settings, alert, trader, history, now_sgt, today, d
         update_runtime_state(last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"), status="SKIPPED_LOSS_CAP")
         db.finish_cycle(run_id, status="SKIPPED", summary={"stage": "daily_caps", "reason": "loss_cap"})
         return None
+
+    # ── v6.0: Daily account drawdown circuit breaker ─────────────────────────
+    # If the account balance has fallen more than max_daily_drawdown_pct% below
+    # the balance recorded at the start of today's trading day, stop all entries
+    # for the rest of the day. This catches multi-session loss days before they
+    # spiral (e.g. Apr 13–14: −$575, May 5: −$390 in a single day).
+    #
+    # The "day open balance" is stored in runtime_state.json at the start of each
+    # trading day. On the first cycle after 08:00 SGT it is written if absent or
+    # stale. On subsequent cycles it is compared against the live OANDA balance.
+    _max_dd_pct = float(settings.get("max_daily_drawdown_pct", 3.0))
+    if _max_dd_pct > 0:
+        _rt_dd = load_json(RUNTIME_STATE_FILE, {})
+        _day_open_bal_key = f"day_open_balance:{today}"
+        _day_open_bal = _rt_dd.get(_day_open_bal_key)
+        if _day_open_bal is None:
+            # First cycle of this trading day — record the opening balance
+            save_json(RUNTIME_STATE_FILE, {
+                **load_json(RUNTIME_STATE_FILE, {}),
+                _day_open_bal_key: round(balance, 2),
+            })
+            _day_open_bal = balance
+            log.info(
+                "Day open balance recorded: $%.2f (%s)",
+                balance, today, extra={"run_id": run_id},
+            )
+        else:
+            _day_open_bal = float(_day_open_bal)
+        # Compute intraday drawdown
+        if _day_open_bal > 0:
+            _dd_pct = (_day_open_bal - balance) / _day_open_bal * 100
+            log.info(
+                "Drawdown check: open=$%.2f live=$%.2f drawdown=%.2f%% limit=%.1f%%",
+                _day_open_bal, balance, _dd_pct, _max_dd_pct,
+                extra={"run_id": run_id},
+            )
+            if _dd_pct >= _max_dd_pct:
+                day_start_h = int(settings.get("trading_day_start_hour_sgt", 8))
+                day_reset_sgt = (now_sgt + timedelta(days=1)).replace(
+                    hour=day_start_h, minute=0, second=0, microsecond=0
+                )
+                _dd_msg = (
+                    f"🔴 Daily drawdown limit hit — account down {_dd_pct:.1f}% "
+                    f"(${_day_open_bal - balance:.0f} from ${_day_open_bal:.0f} open). "
+                    f"No more entries today. Resumes {day_reset_sgt.strftime('%Y-%m-%d %H:%M')} SGT."
+                )
+                log_event("COOLDOWN_ACTIVE", _dd_msg, run_id=run_id)
+                send_once_per_state(
+                    alert, ops, "drawdown_circuit_state",
+                    f"drawdown:{today}:{int(_dd_pct)}",
+                    _dd_msg,
+                )
+                update_runtime_state(
+                    last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
+                    status="SKIPPED_DRAWDOWN_CIRCUIT",
+                )
+                db.finish_cycle(run_id, status="SKIPPED", summary={
+                    "stage": "drawdown_circuit",
+                    "drawdown_pct": round(_dd_pct, 2),
+                    "day_open_balance": _day_open_bal,
+                    "current_balance": balance,
+                })
+                return None
 
     # ── Session win cap (stop trading after N wins in the CURRENT SESSION) ─────
     # v5.5 FIX: was blocking until next trading day (08:00 SGT). Now blocks only
@@ -1713,6 +1798,20 @@ def _signal_phase(db, run_id, settings, alert, trader, history, now_sgt, today, 
     sl_usd   = compute_sl_usd(levels, settings)
     tp_usd   = compute_tp_usd(levels, sl_usd, settings)
     rr_ratio = derive_rr_ratio(levels, sl_usd, tp_usd, settings)
+
+    # v6.0: Scale position_usd DOWN by account currency rate so actual risk
+    # in account currency matches the settings target.
+    # e.g. position_usd=$100, rate=1.28 → effective=$78 USD → $100 SGD at close.
+    _currency_rate = float(account_summary.get("currency_rate", 1.0) or 1.0)
+    if _currency_rate > 1.01:
+        _pos_before  = position_usd
+        position_usd = max(1, round(position_usd / _currency_rate))
+        log.info(
+            "Currency adjustment %.4f: position_usd %d→%d USD (≈$%d account-currency risk)",
+            _currency_rate, _pos_before, position_usd, _pos_before,
+            extra={"run_id": run_id},
+        )
+
     units    = calculate_units_from_position(position_usd, sl_usd)
     tp_pct   = (tp_usd / entry * 100) if entry > 0 else None
 
@@ -1744,6 +1843,59 @@ def _signal_phase(db, run_id, settings, alert, trader, history, now_sgt, today, 
                         summary={"stage": "rr_gate", "rr_ratio": rr_ratio,
                                  "min_rr": _min_rr, "reason": _rr_reason})
         return None
+
+    # ── v6.0: Overall consecutive loss streak guard (any direction) ──────────
+    # The direction guard only fires when the bot repeatedly loses in ONE direction.
+    # Historical data shows 15-trade losing streaks where the bot alternated
+    # BUY/SELL — the direction guard reset each time it switched, allowing the
+    # streak to continue. This guard counts ALL consecutive losses regardless of
+    # direction. After max_overall_loss_streak SLs in a row, entries are blocked
+    # for overall_loss_streak_cooldown_min minutes (default 4 hours).
+    _overall_max  = int(settings.get("max_overall_loss_streak", 3))
+    _overall_cool = int(settings.get("overall_loss_streak_cooldown_min", 240))
+    _overall_streak = consecutive_loss_streak_today(history, today)
+    if _overall_streak >= _overall_max and _overall_cool > 0:
+        # Check if cooldown already running
+        _rt_overall = load_json(RUNTIME_STATE_FILE, {})
+        _overall_block_until = _parse_sgt_timestamp(_rt_overall.get("overall_loss_block_until"))
+        if not _overall_block_until or now_sgt >= _overall_block_until:
+            # First time hitting this streak today — set the cooldown
+            _overall_block_until = now_sgt + timedelta(minutes=_overall_cool)
+            save_json(RUNTIME_STATE_FILE, {
+                **load_json(RUNTIME_STATE_FILE, {}),
+                "overall_loss_block_until": _overall_block_until.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            log.info(
+                "Overall loss streak %d — blocking ALL entries until %s SGT (%dmin)",
+                _overall_streak, _overall_block_until.strftime("%H:%M"), _overall_cool,
+                extra={"run_id": run_id},
+            )
+        if now_sgt < _overall_block_until:
+            _remaining_overall = int((_overall_block_until - now_sgt).total_seconds() / 60)
+            _overall_reason = (
+                f"🛑 Overall loss streak cooldown — {_overall_streak} consecutive SLs today "
+                f"(any direction). No entries for {_remaining_overall}min more "
+                f"(resumes {_overall_block_until.strftime('%H:%M')} SGT). "
+                f"Let the market settle before re-entering."
+            )
+            _send_signal_update("BLOCKED", _overall_reason,
+                                {"session_ok": True, "news_ok": True, "open_trade_ok": True})
+            log.info("Overall streak guard: %s", _overall_reason, extra={"run_id": run_id})
+            send_once_per_state(
+                alert, ops, "overall_streak_state",
+                f"overall_streak:{today}:{_overall_streak}",
+                _overall_reason,
+            )
+            update_runtime_state(
+                last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
+                status="SKIPPED_OVERALL_STREAK_COOLDOWN",
+            )
+            db.finish_cycle(run_id, status="SKIPPED", summary={
+                "stage": "overall_streak_guard",
+                "streak": _overall_streak,
+                "remaining_min": _remaining_overall,
+            })
+            return None
 
     # v4.1: Consecutive-direction loss guard.
     # After N consecutive SL hits in the same direction, require an elevated
