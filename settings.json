@@ -99,5 +99,8 @@
   "post_win_cooldown_hours": 6,
   "ai_reasoning": true,
   "h4_ema_buffer_pct": 0.15,
-  "ai_scale_after_loss": false
+  "ai_scale_after_loss": false,
+  "max_overall_loss_streak": 3,
+  "overall_loss_streak_cooldown_min": 240,
+  "max_daily_drawdown_pct": 3.0
 }
