@@ -91,6 +91,37 @@ class OandaTrader:
             log.error("Login error: %s", e)
             return None
 
+    def get_account_currency_rate(self, instrument: str = "XAU_USD") -> float:
+        """Return live USD-to-account-currency conversion factor.
+
+        OANDA executes XAU/USD P&L in USD then converts to the account home
+        currency (SGD, AUD, etc.).  Without this correction every risk limit
+        in settings is denominated in USD but the account sees SGD values —
+        creating a systematic overcharge equal to the FX rate (≈28% for SGD).
+
+        Uses OANDA's homeConversionFactors.profitHome field from the pricing
+        endpoint.  Returns 1.0 on any failure so USD accounts are unaffected.
+        """
+        try:
+            r = self._request(
+                "GET",
+                f"/v3/accounts/{self.account_id}/pricing",
+                params={"instruments": instrument},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                prices = r.json().get("prices", [])
+                if prices:
+                    hcf  = prices[0].get("homeConversionFactors", {})
+                    rate = float((hcf.get("profitHome") or {}).get("factor", 1.0) or 1.0)
+                    if rate > 0:
+                        log.debug("Account currency conversion rate (USD→home): %.4f", rate)
+                        return rate
+            log.warning("homeConversionFactors unavailable — defaulting to 1.0")
+        except Exception as e:
+            log.warning("get_account_currency_rate error: %s — defaulting to 1.0", e)
+        return 1.0
+
     def get_price(self, instrument):
         try:
             r = self._request(
