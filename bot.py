@@ -281,8 +281,12 @@ def get_session(now: datetime, settings: dict = None):
     h = now.hour
     session_thresholds = (settings or {}).get("session_thresholds", {})
     # v4.4 — per-session enable/disable flags (Asian added)
+    # Monday Asian block: disable Asian session on Mondays regardless of setting
+    _asian_enabled = bool((settings or {}).get("asian_session_enabled", True))
+    if now.weekday() == 0:
+        _asian_enabled = False  # Monday Asian block
     _enabled = {
-        "Asian":  bool((settings or {}).get("asian_session_enabled",  True)),
+        "Asian":  _asian_enabled,
         "London": bool((settings or {}).get("london_session_enabled", True)),
         "US":     bool((settings or {}).get("us_session_enabled",     True)),
     }
