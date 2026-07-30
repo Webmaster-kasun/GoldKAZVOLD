@@ -22,7 +22,8 @@
   "max_trades_day": 20,
   "max_wins_day": 1,
   "max_losing_trades_day": 3,
-  "exhaustion_atr_mult": 1.5,
+  "loss_streak_cooldown_min": 60,
+  "exhaustion_atr_mult": 2.5,
   "max_spread_pips": 160,
   "spread_limits": {
     "London": 140,
@@ -98,10 +99,5 @@
   "post_win_cooldown_hours": 6,
   "ai_reasoning": true,
   "h4_ema_buffer_pct": 0.15,
-  "ai_scale_after_loss": false,
-  "recent_level_lookback_trades": 3,
-  "recent_level_score_boost": 2,
-  "max_overall_loss_streak": 1,
-  "overall_loss_streak_cooldown_min": 60,
-  "max_daily_drawdown_pct": 3.0
+  "ai_scale_after_loss": false
 }

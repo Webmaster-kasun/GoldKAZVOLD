@@ -423,59 +423,6 @@ class SignalEngine:
         else:
             reasons.append("⚠️ ATR unavailable — exhaustion check skipped")
 
-        # ── v7.1: Recent support/resistance level awareness ───────────────
-        # If the bot is about to enter a SELL at a price zone where a BUY SL
-        # was recently hit (or vice versa), that zone is acting as support, not
-        # a breakdown level. Entering in the opposite direction there is low
-        # probability — require a higher score to proceed.
-        #
-        # Real example: T#1 BUY from 4049, T#4 SELL at 4049 → lost because
-        # 4049 was established support. The signal engine had no memory of this.
-        #
-        # Uses history passed via settings["_history"] if available.
-        # Compares current entry against recent SL close prices within 0.5% zone.
-        _history_recent = (settings or {}).get("_history") if settings else None
-        if _history_recent and direction != "NONE":
-            _n_look  = int((settings or {}).get("recent_level_lookback_trades", 3))
-            _boost   = int((settings or {}).get("recent_level_score_boost", 2))
-            _zone_pct = 0.005   # 0.5% price zone around recent SL close price
-            _filled  = [t for t in _history_recent if t.get("status") == "FILLED"]
-            _recent  = _filled[-_n_look:] if len(_filled) >= _n_look else _filled
-            _opposite_dir = "SELL" if direction == "BUY" else "BUY"
-            _level_conflict = False
-            for _ht in _recent:
-                _ht_dir = _ht.get("direction", "")
-                _ht_pl  = _ht.get("realized_pnl_usd")
-                # Check: recent trade in OPPOSITE direction that hit SL near current entry
-                if (_ht_dir == _opposite_dir
-                        and isinstance(_ht_pl, (int, float)) and _ht_pl < 0):
-                    _ht_sl_price = _ht.get("sl_price") or _ht.get("close_price")
-                    if _ht_sl_price:
-                        _diff_pct = abs(current_close - float(_ht_sl_price)) / current_close
-                        if _diff_pct <= _zone_pct:
-                            _level_conflict = True
-                            reasons.append(
-                                f"⚠️ Recent {_opposite_dir} SL near {float(_ht_sl_price):.2f} "
-                                f"({_diff_pct*100:.2f}% from entry) — zone acting as "
-                                f"{'support' if direction == 'SELL' else 'resistance'} "
-                                f"(require score +{_boost} extra to enter)"
-                            )
-                            log.info(
-                                "Recent level conflict: %s entry near recent %s SL at %.2f "
-                                "— requiring score boost %d",
-                                direction, _opposite_dir, float(_ht_sl_price), _boost,
-                            )
-                            break
-            if _level_conflict:
-                _required_boosted = int((settings or {}).get("signal_threshold", 4)) + _boost
-                if score < _required_boosted:
-                    reasons.append(
-                        f"🚫 Score {score} < {_required_boosted} (boosted threshold at recent level) — blocked"
-                    )
-                    levels["score"] = 0
-                    levels["signal_blockers"] = [f"Recent level conflict — score {score} < {_required_boosted}"]
-                    return 0, "NONE", " | ".join(reasons), levels, 0
-
         # ── Position size ──────────────────────────────────────────────────
         position_usd = score_to_position_usd(score, settings)
 

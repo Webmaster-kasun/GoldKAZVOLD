@@ -1557,10 +1557,7 @@ def _signal_phase(db, run_id, settings, alert, trader, history, now_sgt, today, 
 
     # ── Signal ────────────────────────────────────────────────────────────────
     engine = SignalEngine(demo=demo)
-    # v7.1: pass recent history so signal engine can detect recent support/resistance levels
-    settings["_history"] = history[-20:] if history else []
     score, direction, details, levels, position_usd = engine.analyze(asset=ASSET, settings=settings)
-    settings.pop("_history", None)  # remove after call — don't persist to disk
 
     raw_score        = score
     raw_position_usd = position_usd
