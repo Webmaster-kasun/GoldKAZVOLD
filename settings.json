@@ -10,7 +10,7 @@
   "atr_sl_multiplier": 1.0,
   "sl_min_usd": 15.0,
   "sl_max_usd": 17.0,
-  "rr_ratio": 3.0172,
+  "rr_ratio": 3.0,
   "max_rr_ratio": 3.0172,
   "breakeven_trigger_usd": 20.0,
   "margin_safety_factor": 0.75,
